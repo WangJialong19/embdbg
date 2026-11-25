@@ -14,6 +14,7 @@ use embdbg_core::transport::{
 
 use crate::fonts::{icon, icon_label};
 use crate::icons::outline;
+use crate::settings::{ConnectionForm, Interface};
 use crate::theme::{self, DANGER, FG_DIM, SPACE_1, SPACE_2, SPACE_3};
 use crate::util::format_rate;
 
@@ -26,35 +27,23 @@ const BAUDS: [u32; 7] = [9_600, 19_200, 38_400, 57_600, 115_200, 921_600, 3_000_
 /// Batches the simulator delivers per second at any rate.
 const BATCH_HZ: f64 = 50.0;
 
-/// What the panel is set up to open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Interface {
-    #[default]
-    Serial,
-    TcpClient,
-    TcpServer,
-    Simulator,
+/// The name in the selector.
+fn interface_label(interface: Interface) -> &'static str {
+    match interface {
+        Interface::Serial => "串口",
+        Interface::TcpClient => "TCP 客户端",
+        Interface::TcpServer => "TCP 服务器",
+        Interface::Simulator => "模拟信号源",
+    }
 }
 
-impl Interface {
-    /// The name in the selector.
-    fn label(self) -> &'static str {
-        match self {
-            Self::Serial => "串口",
-            Self::TcpClient => "TCP 客户端",
-            Self::TcpServer => "TCP 服务器",
-            Self::Simulator => "模拟信号源",
-        }
-    }
-
-    /// One line under the selector.
-    fn hint(self) -> &'static str {
-        match self {
-            Self::Serial => "USB 转串口、COM 口",
-            Self::TcpClient => "主动连接远端地址",
-            Self::TcpServer => "在本机监听，等待设备接入",
-            Self::Simulator => "没有硬件时产生的 8 通道波形",
-        }
+/// One line under the selector.
+fn interface_hint(interface: Interface) -> &'static str {
+    match interface {
+        Interface::Serial => "USB 转串口、COM 口",
+        Interface::TcpClient => "主动连接远端地址",
+        Interface::TcpServer => "在本机监听，等待设备接入",
+        Interface::Simulator => "没有硬件时产生的 8 通道波形",
     }
 }
 
@@ -80,29 +69,68 @@ pub struct ConnectionsState {
 
 impl Default for ConnectionsState {
     fn default() -> Self {
-        let ports = list_ports();
-        let port = ports
-            .first()
-            .map_or_else(String::new, |port| port.name.clone());
-        Self {
-            interface: Interface::Serial,
-            rate: RATES.len() - 1,
-            ports,
-            port,
-            baud: 115_200,
-            data_bits: 8,
-            parity: ParityChoice::None,
-            stop_bits: 1,
-            flow: FlowChoice::None,
-            host: "127.0.0.1".to_owned(),
-            client_port: "8080".to_owned(),
-            bind: "0.0.0.0".to_owned(),
-            server_port: "8080".to_owned(),
-        }
+        Self::from_form(ConnectionForm::default())
     }
 }
 
 impl ConnectionsState {
+    /// Rebuilds the panel from what was saved. A port that has gone missing falls back to the
+    /// first one that is there now, and values the form no longer offers fall back to defaults.
+    pub fn from_form(form: ConnectionForm) -> Self {
+        let ports = list_ports();
+        let port = if ports.iter().any(|port| port.name == form.port) {
+            form.port
+        } else {
+            ports
+                .first()
+                .map_or_else(String::new, |port| port.name.clone())
+        };
+        Self {
+            interface: form.interface,
+            rate: RATES
+                .iter()
+                .position(|rate| (rate - form.simulator_rate).abs() < 1.0)
+                .unwrap_or(RATES.len() - 1),
+            ports,
+            port,
+            baud: if BAUDS.contains(&form.baud) {
+                form.baud
+            } else {
+                115_200
+            },
+            data_bits: if (5..=8).contains(&form.data_bits) {
+                form.data_bits
+            } else {
+                8
+            },
+            parity: parse_parity(&form.parity),
+            stop_bits: if form.stop_bits == 2 { 2 } else { 1 },
+            flow: parse_flow(&form.flow),
+            host: form.host,
+            client_port: form.client_port,
+            bind: form.bind,
+            server_port: form.server_port,
+        }
+    }
+
+    /// What to save for the next start.
+    pub fn form(&self) -> ConnectionForm {
+        ConnectionForm {
+            interface: self.interface,
+            port: self.port.clone(),
+            baud: self.baud,
+            data_bits: self.data_bits,
+            parity: parity_name(self.parity).to_owned(),
+            stop_bits: self.stop_bits,
+            flow: flow_name(self.flow).to_owned(),
+            host: self.host.clone(),
+            client_port: self.client_port.clone(),
+            bind: self.bind.clone(),
+            server_port: self.server_port.clone(),
+            simulator_rate: RATES[self.rate],
+        }
+    }
+
     pub fn simulator_config(&self) -> SimulatorConfig {
         SimulatorConfig {
             sample_rate: RATES[self.rate],
@@ -138,7 +166,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
     ui.label(RichText::new("数据接口").small().color(FG_DIM));
     ComboBox::from_id_salt("interface")
         .width(ui.available_width())
-        .selected_text(state.interface.label())
+        .selected_text(interface_label(state.interface))
         .show_ui(ui, |ui| {
             for interface in [
                 Interface::Serial,
@@ -146,10 +174,14 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
                 Interface::TcpServer,
                 Interface::Simulator,
             ] {
-                ui.selectable_value(&mut state.interface, interface, interface.label());
+                ui.selectable_value(&mut state.interface, interface, interface_label(interface));
             }
         });
-    ui.label(RichText::new(state.interface.hint()).small().color(FG_DIM));
+    ui.label(
+        RichText::new(interface_hint(state.interface))
+            .small()
+            .color(FG_DIM),
+    );
 
     // Only the chosen interface takes space.
     match state.interface {
@@ -389,9 +421,9 @@ fn tcp_client_form(
         .show(ui, |ui| {
             ui.label("地址");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut state.host).desired_width(88.0));
+                ui.add(egui::TextEdit::singleline(&mut state.host).desired_width(96.0));
                 ui.label(":");
-                ui.add(egui::TextEdit::singleline(&mut state.client_port).desired_width(46.0));
+                ui.add(egui::TextEdit::singleline(&mut state.client_port).desired_width(56.0));
             });
             ui.end_row();
         });
@@ -430,9 +462,9 @@ fn tcp_server_form(
         .show(ui, |ui| {
             ui.label("绑定");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut state.bind).desired_width(88.0));
+                ui.add(egui::TextEdit::singleline(&mut state.bind).desired_width(96.0));
                 ui.label(":");
-                ui.add(egui::TextEdit::singleline(&mut state.server_port).desired_width(46.0));
+                ui.add(egui::TextEdit::singleline(&mut state.server_port).desired_width(56.0));
             });
             ui.end_row();
         });
@@ -503,11 +535,43 @@ fn parity_label(parity: ParityChoice) -> &'static str {
     }
 }
 
+fn parity_name(parity: ParityChoice) -> &'static str {
+    match parity {
+        ParityChoice::None => "none",
+        ParityChoice::Odd => "odd",
+        ParityChoice::Even => "even",
+    }
+}
+
+fn parse_parity(text: &str) -> ParityChoice {
+    match text {
+        "odd" => ParityChoice::Odd,
+        "even" => ParityChoice::Even,
+        _ => ParityChoice::None,
+    }
+}
+
 fn flow_label(flow: FlowChoice) -> &'static str {
     match flow {
         FlowChoice::None => "无",
         FlowChoice::Software => "软件",
         FlowChoice::Hardware => "硬件",
+    }
+}
+
+fn flow_name(flow: FlowChoice) -> &'static str {
+    match flow {
+        FlowChoice::None => "none",
+        FlowChoice::Software => "software",
+        FlowChoice::Hardware => "hardware",
+    }
+}
+
+fn parse_flow(text: &str) -> FlowChoice {
+    match text {
+        "software" => FlowChoice::Software,
+        "hardware" => FlowChoice::Hardware,
+        _ => FlowChoice::None,
     }
 }
 
@@ -566,8 +630,8 @@ mod tests {
             Interface::TcpServer,
             Interface::Simulator,
         ] {
-            assert!(!interface.label().is_empty());
-            assert!(!interface.hint().is_empty());
+            assert!(!interface_label(interface).is_empty());
+            assert!(!interface_hint(interface).is_empty());
         }
         for spec in [
             DecoderSpec::Line,
@@ -576,6 +640,44 @@ mod tests {
         ] {
             assert!(!decoder_label(spec).is_empty());
         }
+    }
+
+    #[test]
+    fn the_form_round_trips_through_the_panel() {
+        let first = ConnectionsState::default();
+        let second = ConnectionsState::from_form(first.form());
+        assert_eq!(second.form(), first.form());
+
+        let state = ConnectionsState::from_form(ConnectionForm {
+            interface: Interface::TcpServer,
+            bind: "127.0.0.1".to_owned(),
+            server_port: "9999".to_owned(),
+            parity: "even".to_owned(),
+            flow: "hardware".to_owned(),
+            ..ConnectionForm::default()
+        });
+        assert_eq!(state.interface, Interface::TcpServer);
+        assert_eq!(state.bind, "127.0.0.1");
+        assert_eq!(state.server_port, "9999");
+        assert_eq!(state.parity, ParityChoice::Even);
+        assert_eq!(state.flow, FlowChoice::Hardware);
+    }
+
+    #[test]
+    fn values_the_form_no_longer_offers_fall_back_to_defaults() {
+        let state = ConnectionsState::from_form(ConnectionForm {
+            baud: 123_456,
+            data_bits: 9,
+            stop_bits: 7,
+            parity: "unknown".to_owned(),
+            flow: "unknown".to_owned(),
+            ..ConnectionForm::default()
+        });
+        assert_eq!(state.baud, 115_200);
+        assert_eq!(state.data_bits, 8);
+        assert_eq!(state.stop_bits, 1);
+        assert_eq!(state.parity, ParityChoice::None);
+        assert_eq!(state.flow, FlowChoice::None);
     }
 
     #[test]

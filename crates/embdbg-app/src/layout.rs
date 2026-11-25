@@ -15,10 +15,10 @@ use crate::app::Tab;
 use crate::logging;
 
 /// Bumped when the meaning of a saved layout changes; older files then fall back to the default.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// Every tab except the channel table: the table can be closed, the rest cannot.
-const REQUIRED: [Tab; 9] = [
+const REQUIRED: [Tab; 10] = [
     Tab::Connections,
     Tab::Waveform,
     Tab::Xy,
@@ -26,6 +26,7 @@ const REQUIRED: [Tab; 9] = [
     Tab::Histogram,
     Tab::Terminal,
     Tab::Hex,
+    Tab::Ai,
     Tab::Send,
     Tab::Log,
 ];
@@ -224,9 +225,11 @@ mod tests {
     #[test]
     fn a_layout_from_another_version_is_refused() {
         let dock = default_dock();
-        let text = serialize(&dock)
-            .unwrap()
-            .replacen("\"version\": 1", "\"version\": 99", 1);
+        let text = serialize(&dock).unwrap().replacen(
+            &format!("\"version\": {VERSION}"),
+            "\"version\": 99",
+            1,
+        );
         let dir = temp_dir();
         let path = dir.join("layout.json");
         write_to(&path, &text).unwrap();

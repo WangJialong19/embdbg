@@ -44,8 +44,39 @@ target/release/embdbg.exe                # 空界面
 | `--serial-decoder NAME` | 配合 `--serial` 的协议：`line`/`justfloat`/`justint` |
 | `embdbg ports` | 列出本机串口并退出 |
 | `embdbg serial PORT [--baud N] [--decoder NAME] [--listen S] [--send TEXT] [--hex-send HEX]` | 无界面串口自检：收发并打印解码结果与统计 |
+| `embdbg mcp` | 以 MCP 服务运行：有窗口时接管当前会话，否则无界面运行 |
 
-设置与日志：`%LOCALAPPDATA%\embdbg\config.toml`、`%LOCALAPPDATA%\embdbg\logs\`。
+设置、布局与日志：`%LOCALAPPDATA%\embdbg\config.toml`、`layout.json`、`logs\`。连接表单、发送宏与窗口布局都会记住。
+
+## MCP：让 AI 操作这台调试助手
+
+在 AI 客户端里把 MCP 命令配置成 `embdbg mcp`（stdio 传输）：
+
+- 有窗口在运行时，`mcp` 进程通过本机命名管道连到窗口，AI 的每一步都发生在你眼前的会话里，并在「AI」页签留下调用记录；
+- 没有窗口时，同一个命令在进程内无界面启动引擎，工具集不变；
+- 端点只在本机（Windows 命名管道 / Unix 本地套接字），不监听网络端口。
+
+| 类别 | 工具 |
+|---|---|
+| 连接 | `list_serial_ports`、`open_connection`（serial / tcp-client / tcp-server / simulator）、`close_connection`、`list_connections` |
+| 收发 | `send`、`read_lines`、`read_terminal`、`wait_for`、`send_and_wait` |
+| 分析 | `list_channels`、`read_samples`、`get_fft`、`get_histogram`、`get_stats` |
+| 会话 | `screenshot`（仅窗口模式：把 PNG 存到临时目录并返回路径） |
+
+典型用法：让 AI 打开模拟源、读通道、算 FFT 峰值并截图；或打开串口发一条 AT 指令，`wait_for` 到 `OK` 后再读终端。
+
+客户端配置示例（路径换成你的 release 可执行文件）：
+
+```json
+{
+  "mcpServers": {
+    "embdbg": {
+      "command": "E:\\home\\hugo\\调试助手\\target\\release\\embdbg.exe",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
 ## 界面与渲染后端
 
@@ -89,8 +120,10 @@ tools/measure.ps1 内存/CPU 采样脚本
   - 连接面板按 VOFA 的方式组织：顶部「数据接口」选择串口 / TCP 客户端 / TCP 服务器 / 模拟信号源，只显示所选接口的参数，再往下的连接列表与协议不变。
   - 终端是 VT100 仿真：ANSI 颜色、光标、回车覆盖整行、滚轮回看历史、按键直通（方向键、Ctrl 组合、粘贴），输入法候选窗跟随光标；鼠标拖选或双击选词后 Ctrl+Shift+C 复制，选中期间画面暂停刷新，点击恢复。
   - 窗口布局会记住：页签位置、活动页签、分栏比例、通道面板的开关都存在 `%LOCALAPPDATA%\embdbg\layout.json`，下次启动原样恢复。
-  - M1 后续补：发送宏、连接表单的持久化。
-- [ ] **M2 MCP**：rmcp 服务、stdio 桥与命名管道、无界面模式。
+  - 连接表单（接口、端口、波特率、数据位/校验/停止位/流控、TCP 地址）与发送宏存入 `config.toml`，重启后还在。
+- [x] **M2 MCP**：rmcp 3.11 服务、14 个工具、stdio 桥、命名管道接管窗口、无界面模式、AI 活动页签与截图工具。
+  - 已用脚本端到端验证两条路径：无窗口时进程内服务；有窗口时 `embdbg mcp` 接管会话，工具调用会出现在界面的「AI」页签里。
+  - 还需用真实 AI 客户端（ZCode）走一遍工具调用，并把"AI 写操作"的权限开关放到 M3 的网络工具里一起做。
 - [ ] **M3 网络**：UDP/WebSocket、MQTT、Modbus、网络小工具。
 - [ ] **M4 WASM 插件**。
 - [ ] **M5 打磨发布**。

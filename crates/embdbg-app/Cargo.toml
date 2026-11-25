@@ -27,3 +27,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
 png = "0.17"
+interprocess = { workspace = true }
+rmcp = { workspace = true }

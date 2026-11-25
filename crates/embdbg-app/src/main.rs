@@ -10,6 +10,7 @@ mod headless;
 mod icons;
 mod layout;
 mod logging;
+mod mcp_host;
 mod panels;
 mod plots;
 mod screenshot;
@@ -115,26 +116,33 @@ enum Command {
     },
     /// 列出本机串口
     Ports,
+    /// 以 MCP 服务运行：有窗口时接管当前会话，否则无界面运行
+    Mcp,
 }
 
 fn main() -> anyhow::Result<()> {
     attach_parent_console();
-    let result = run();
-    if let Err(error) = &result {
-        // A window program has no console to print a startup failure to.
+    let cli = Cli::parse();
+    // A window program has no console to print a startup failure to. A subcommand is a console
+    // program run by a person or an AI client; a dialog would block it.
+    let headless = cli.command.is_some();
+    let result = run(cli);
+    if let Err(error) = &result
+        && !headless
+    {
         show_failure(&format!("{error:#}"));
     }
     result
 }
 
-fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> anyhow::Result<()> {
     logging::init().context("初始化日志失败")?;
     logging::capture_panics();
 
     // Subcommands that need no window run before the graphics stack is set up at all.
     match &cli.command {
         Some(Command::Ports) => return headless::ports(),
+        Some(Command::Mcp) => return mcp_host::run_stdio(),
         Some(Command::Serial {
             port,
             baud,

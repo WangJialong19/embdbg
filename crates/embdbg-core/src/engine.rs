@@ -245,6 +245,11 @@ impl Engine {
         self.clock
     }
 
+    /// A handle to the runtime the transports run on, for work that belongs beside them.
+    pub fn runtime(&self) -> Handle {
+        self.rt.clone()
+    }
+
     /// Increments whenever any connection stores new samples or lines.
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)

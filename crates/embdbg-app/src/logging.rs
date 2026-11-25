@@ -36,7 +36,8 @@ pub fn capture_panics() {
 }
 
 pub fn init() -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rmcp=warn"));
     let stderr = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)

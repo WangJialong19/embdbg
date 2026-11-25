@@ -49,6 +49,79 @@ impl RendererChoice {
     }
 }
 
+/// Which transport the connection panel is set up for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Interface {
+    #[default]
+    Serial,
+    TcpClient,
+    TcpServer,
+    Simulator,
+}
+
+/// The connection form as it was left, so a restart finds the same interface and values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectionForm {
+    pub interface: Interface,
+    pub port: String,
+    pub baud: u32,
+    pub data_bits: u8,
+    /// `none`, `odd` or `even`.
+    pub parity: String,
+    pub stop_bits: u8,
+    /// `none`, `software` or `hardware`.
+    pub flow: String,
+    pub host: String,
+    pub client_port: String,
+    pub bind: String,
+    pub server_port: String,
+    /// Samples per second for the simulator.
+    pub simulator_rate: f64,
+}
+
+impl Default for ConnectionForm {
+    fn default() -> Self {
+        Self {
+            interface: Interface::Serial,
+            port: String::new(),
+            baud: 115_200,
+            data_bits: 8,
+            parity: "none".to_owned(),
+            stop_bits: 1,
+            flow: "none".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            client_port: "8080".to_owned(),
+            bind: "0.0.0.0".to_owned(),
+            server_port: "8080".to_owned(),
+            simulator_rate: 1e6,
+        }
+    }
+}
+
+/// A saved message: one click sends it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SendMacro {
+    pub name: String,
+    pub text: String,
+    pub hex: bool,
+    /// `none`, `cr`, `lf` or `crlf`.
+    pub ending: String,
+}
+
+impl Default for SendMacro {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            text: String::new(),
+            hex: false,
+            ending: "crlf".to_owned(),
+        }
+    }
+}
+
 /// Everything that survives a restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,6 +129,10 @@ pub struct Settings {
     pub renderer: RendererChoice,
     /// Repaint ceiling per second while data streams; 0 follows the display's refresh rate.
     pub max_fps: f64,
+    /// The connection panel's interface and fields.
+    pub connections: ConnectionForm,
+    /// Saved messages of the send panel.
+    pub macros: Vec<SendMacro>,
 }
 
 impl Default for Settings {
@@ -63,6 +140,8 @@ impl Default for Settings {
         Self {
             renderer: RendererChoice::Auto,
             max_fps: 0.0,
+            connections: ConnectionForm::default(),
+            macros: Vec::new(),
         }
     }
 }
@@ -150,6 +229,17 @@ mod tests {
         let settings = Settings {
             renderer: RendererChoice::Vulkan,
             max_fps: 60.0,
+            connections: ConnectionForm {
+                interface: Interface::TcpClient,
+                host: "192.168.1.20".to_owned(),
+                client_port: "9000".to_owned(),
+                ..ConnectionForm::default()
+            },
+            macros: vec![SendMacro {
+                name: "版本".to_owned(),
+                text: "AT+VER?".to_owned(),
+                ..SendMacro::default()
+            }],
         };
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), settings);
@@ -186,20 +276,22 @@ mod tests {
         let saved = Settings {
             renderer: RendererChoice::Glow,
             max_fps: 30.0,
+            ..Settings::default()
+        };
+        let expected = Settings {
+            renderer: RendererChoice::Vulkan,
+            max_fps: 30.0,
+            ..Settings::default()
         };
         assert_eq!(
             saved.clone().with_cli(Some(RendererChoice::Vulkan), None),
-            Settings {
-                renderer: RendererChoice::Vulkan,
-                max_fps: 30.0
-            }
+            expected
         );
-        assert_eq!(
-            saved.with_cli(None, Some(0.0)),
-            Settings {
-                renderer: RendererChoice::Glow,
-                max_fps: 0.0
-            }
-        );
+        let expected = Settings {
+            renderer: RendererChoice::Glow,
+            max_fps: 0.0,
+            ..Settings::default()
+        };
+        assert_eq!(saved.with_cli(None, Some(0.0)), expected);
     }
 }

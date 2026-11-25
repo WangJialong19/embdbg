@@ -17,6 +17,15 @@ pub enum DecoderSpec {
 }
 
 impl DecoderSpec {
+    /// The name the MCP tools use.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Line => "line",
+            Self::JustFloat => "justfloat",
+            Self::JustInt => "justint",
+        }
+    }
+
     /// What the protocol needs from the framer.
     pub fn framing(self) -> super::framing::Framing {
         match self {

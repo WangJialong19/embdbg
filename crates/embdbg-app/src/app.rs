@@ -16,6 +16,7 @@ use crate::fonts;
 use crate::fonts::icon_label;
 use crate::icons::outline;
 use crate::panels;
+use crate::panels::ai::AiState;
 use crate::panels::connections::ConnectionsState;
 use crate::panels::hex::HexState;
 use crate::panels::histogram::HistogramState;
@@ -89,6 +90,7 @@ pub(crate) enum Tab {
     Histogram,
     Terminal,
     Hex,
+    Ai,
     Send,
     Inspector,
     Log,
@@ -105,6 +107,7 @@ impl Tab {
             "histogram" | "hist" => Self::Histogram,
             "terminal" => Self::Terminal,
             "hex" => Self::Hex,
+            "ai" | "mcp" => Self::Ai,
             "send" => Self::Send,
             "inspector" => Self::Inspector,
             "log" => Self::Log,
@@ -121,6 +124,7 @@ impl Tab {
             Tab::Histogram => "直方图",
             Tab::Terminal => "终端",
             Tab::Hex => "十六进制",
+            Tab::Ai => "AI",
             Tab::Send => "发送",
             Tab::Inspector => "通道",
             Tab::Log => "日志",
@@ -151,6 +155,7 @@ pub(crate) fn default_dock() -> egui_dock::DockState<Tab> {
         Tab::Histogram,
         Tab::Terminal,
         Tab::Hex,
+        Tab::Ai,
     ]);
     let tree = dock.main_surface_mut();
     // `split_*` returns `[old, new]`, and the fraction is the share of whichever child comes
@@ -513,6 +518,11 @@ fn describe_backend(cc: &eframe::CreationContext<'_>) -> String {
 pub struct EmbDbgApp {
     engine: Arc<Engine>,
     events: broadcast::Receiver<Event>,
+    ai_feed: broadcast::Receiver<embdbg_core::mcp::Activity>,
+    /// Screenshot requests from MCP clients, answered by the next frame.
+    screenshot_asks:
+        tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    screenshot_seq: u64,
     backend: String,
     settings: WindowSettings,
     dock: egui_dock::DockState<Tab>,
@@ -525,6 +535,7 @@ pub struct EmbDbgApp {
     xy: XyState,
     spectrum: SpectrumState,
     histogram: HistogramState,
+    ai: AiState,
     wave: WaveView,
     wave_scratch: WaveScratch,
     perf: PerfMonitor,
@@ -542,6 +553,10 @@ pub struct EmbDbgApp {
     saved_layout: String,
     /// When the layout was last compared with the file.
     layout_checked: Instant,
+    /// The connection form as last written, so a quiet panel does not rewrite the file.
+    saved_form: crate::settings::ConnectionForm,
+    /// When the connection form was last compared with the file.
+    form_checked: Instant,
 }
 
 /// A pending `--screenshot`, taken once its delay has passed.
@@ -569,6 +584,7 @@ impl EmbDbgApp {
         ));
 
         let saved = settings.persisted.clone();
+        let macros = saved.macros.clone();
         let startup_decoder = settings.startup_decoder;
         let pending = saved.clone();
         let open_settings = settings.open_settings;
@@ -609,21 +625,30 @@ impl EmbDbgApp {
         let dock = startup_dock(initial_tab.as_deref());
         let saved_layout = crate::layout::serialize(&dock).unwrap_or_default();
         let persist_layout = settings.persist_layout;
+        let form = saved.connections.clone();
+        let (shot_tx, shot_rx) = tokio::sync::mpsc::unbounded_channel();
+        let port: embdbg_core::mcp::ScreenshotPort =
+            Arc::new(move |reply| shot_tx.send(reply).is_ok());
+        let ai_feed = crate::mcp_host::spawn_server(Arc::clone(&engine), Some(port));
 
         Ok(Self {
             events: engine.subscribe(),
+            ai_feed,
+            screenshot_asks: shot_rx,
+            screenshot_seq: 0,
             engine,
             backend,
             settings,
             dock,
-            connections: ConnectionsState::default(),
+            connections: ConnectionsState::from_form(form.clone()),
             channels: ChannelUi::default(),
             terminal: TerminalState::default(),
             hex: HexState::default(),
-            send: SendState::default(),
+            send: SendState::with_macros(macros),
             xy: XyState::default(),
             spectrum: SpectrumState::default(),
             histogram: HistogramState::default(),
+            ai: AiState::default(),
             log,
             wave: WaveView::default(),
             wave_scratch: WaveScratch::default(),
@@ -634,6 +659,8 @@ impl EmbDbgApp {
             pending,
             saved,
             persist_layout,
+            saved_form: form,
+            form_checked: Instant::now(),
             saved_layout,
             layout_checked: Instant::now(),
         })
@@ -752,6 +779,7 @@ impl EmbDbgApp {
             xy,
             spectrum,
             histogram,
+            ai,
             ..
         } = self;
         let mut viewer = DockViewer {
@@ -767,6 +795,7 @@ impl EmbDbgApp {
             xy,
             spectrum,
             histogram,
+            ai,
         };
         egui_dock::DockArea::new(dock)
             .style(egui_dock::Style::from_egui(ui.style()))
@@ -843,6 +872,7 @@ struct DockViewer<'a> {
     xy: &'a mut XyState,
     spectrum: &'a mut SpectrumState,
     histogram: &'a mut HistogramState,
+    ai: &'a mut AiState,
 }
 
 impl egui_dock::TabViewer for DockViewer<'_> {
@@ -892,6 +922,7 @@ impl egui_dock::TabViewer for DockViewer<'_> {
                 let shared = self.engine.active_shared();
                 panels::hex::ui(ui, &shared, self.hex);
             }
+            Tab::Ai => panels::ai::ui(ui, self.ai),
             Tab::Send => {
                 let active = self.engine.active();
                 if let Some(error) = panels::send::ui(ui, self.engine, active.as_deref(), self.send)
@@ -1044,9 +1075,34 @@ impl PerfTest {
 impl eframe::App for EmbDbgApp {
     /// Runs before every frame, and also while the window is hidden. The place to drain engine
     /// events: nothing here may touch the UI.
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.events.try_recv() {
             self.log.push_event(&event);
+        }
+        while let Ok(reply) = self.screenshot_asks.try_recv() {
+            let path = std::env::temp_dir().join("embdbg").join(format!(
+                "screenshot-{}-{}.png",
+                std::process::id(),
+                self.screenshot_seq
+            ));
+            self.screenshot_seq = self.screenshot_seq.wrapping_add(1);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let saved = path.clone();
+            ctx.request_screenshot(move |image| {
+                let result = crate::screenshot::save_png(&image, &saved)
+                    .map(|()| saved.display().to_string())
+                    .map_err(|error| format!("保存截图失败：{error}"));
+                let _ = reply.send(result);
+            });
+        }
+        loop {
+            match self.ai_feed.try_recv() {
+                Ok(activity) => self.ai.push(activity),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
         }
     }
 
@@ -1071,6 +1127,10 @@ impl eframe::App for EmbDbgApp {
 
         // The dock has taken this frame's clicks and drags by now.
         self.save_layout(false);
+        self.save_connection_form(false);
+        if self.send.take_macros_changed() {
+            self.save_macros();
+        }
 
         let ctx = ui.ctx().clone();
         self.handle_settings(&ctx);
@@ -1086,9 +1146,14 @@ impl eframe::App for EmbDbgApp {
         self.schedule_repaint(&ctx);
     }
 
-    /// The last chance to keep a layout the one-second check has not written yet.
+    /// The last chance to keep a layout or a connection form the one-second check has not
+    /// written yet.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_layout(true);
+        self.save_connection_form(true);
+        if self.send.take_macros_changed() {
+            self.save_macros();
+        }
     }
 }
 
@@ -1156,6 +1221,45 @@ impl EmbDbgApp {
         }
     }
 
+    /// Writes the connection form when it has changed: the interface and the values in its
+    /// fields. At most once a second, so typing an address does not rewrite the file per key.
+    fn save_connection_form(&mut self, force: bool) {
+        if !self.persist_layout {
+            return;
+        }
+        if !force && self.form_checked.elapsed() < LAYOUT_CHECK_INTERVAL {
+            return;
+        }
+        self.form_checked = Instant::now();
+        let form = self.connections.form();
+        if !force && form == self.saved_form {
+            return;
+        }
+        self.saved_form = form.clone();
+        // Write the settings as last saved, with only this section replaced, so an open settings
+        // window's unsaved edits stay unsaved. The pending copy follows, or its next save would
+        // put the old values back.
+        let mut next = self.saved.clone();
+        next.connections = form.clone();
+        self.pending.connections = form;
+        match next.save() {
+            Ok(()) => self.saved = next,
+            Err(error) => self.log.error(format!("保存连接设置失败：{error}")),
+        }
+    }
+
+    /// Writes the send macros when one was added, replaced or removed.
+    fn save_macros(&mut self) {
+        let macros = self.send.macros.clone();
+        let mut next = self.saved.clone();
+        next.macros = macros.clone();
+        self.pending.macros = macros;
+        match next.save() {
+            Ok(()) => self.saved = next,
+            Err(error) => self.log.error(format!("保存发送宏失败：{error}")),
+        }
+    }
+
     /// Starts the program over, which is what a new renderer needs.
     fn restart(&self, ctx: &egui::Context) {
         match std::env::current_exe() {
@@ -1209,6 +1313,7 @@ mod tests {
             Tab::Histogram,
             Tab::Terminal,
             Tab::Hex,
+            Tab::Ai,
             Tab::Send,
             Tab::Inspector,
             Tab::Log,
@@ -1226,7 +1331,7 @@ mod tests {
         assert!(!channels_panel_open(&dock));
         // Everything else stays in the layout.
         let tabs: Vec<Tab> = dock.main_surface().tabs().copied().collect();
-        assert_eq!(tabs.len(), 9);
+        assert_eq!(tabs.len(), 10);
         assert!(!tabs.contains(&Tab::Inspector));
 
         set_channels_panel(&mut dock, true);
@@ -1308,6 +1413,7 @@ mod tests {
                 Tab::Histogram,
                 Tab::Terminal,
                 Tab::Hex,
+                Tab::Ai,
             ]
         );
         assert_eq!(tabs_at(center.right()), [Tab::Send, Tab::Log]);

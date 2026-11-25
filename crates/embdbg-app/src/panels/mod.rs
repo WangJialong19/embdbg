@@ -1,5 +1,6 @@
 //! The side panels and the views that are not plots.
 
+pub mod ai;
 pub mod connections;
 pub mod hex;
 pub mod histogram;

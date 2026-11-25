@@ -7,6 +7,7 @@ pub mod analysis;
 pub mod api;
 pub mod clock;
 pub mod engine;
+pub mod mcp;
 pub mod pipeline;
 pub mod platform;
 pub mod transport;
