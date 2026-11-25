@@ -10,6 +10,7 @@ use parking_lot::RwLock;
 use super::decoder::{Decoded, Decoder, DecoderSpec};
 use super::framing::Framer;
 use super::set::ChannelSet;
+use super::terminal::Terminal;
 use super::traffic::{ByteLog, Direction, LineLog, TrafficStats};
 
 /// Per-connection settings that decide how bytes become data.
@@ -32,6 +33,8 @@ pub struct SessionShared {
     pub channels: RwLock<ChannelSet>,
     pub lines: RwLock<LineLog>,
     pub bytes: RwLock<ByteLog>,
+    /// The terminal screen: every received byte, with escape sequences applied.
+    pub terminal: RwLock<Terminal>,
     pub stats: TrafficStats,
 }
 
@@ -52,6 +55,7 @@ impl SessionShared {
             channels: RwLock::new(ChannelSet::new(capacity)),
             lines: RwLock::new(LineLog::with_default_capacity()),
             bytes: RwLock::new(ByteLog::with_default_capacity()),
+            terminal: RwLock::new(Terminal::new(40, 100)),
             stats: TrafficStats::default(),
         }
     }
@@ -61,6 +65,7 @@ impl SessionShared {
         self.channels.write().clear();
         self.lines.write().clear();
         self.bytes.write().clear();
+        self.terminal.write().clear();
         self.stats.clear();
     }
 }
@@ -109,6 +114,8 @@ impl DataSession {
             .rx_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         shared.bytes.write().push(t, Direction::RemoteToHere, bytes);
+        // The screen sees every byte, escape sequences included.
+        shared.terminal.write().feed(bytes);
 
         let framed = {
             let decoder = &mut self.decoder;

@@ -33,8 +33,16 @@ use crate::util::{format_count, format_rate};
 const TOOLBAR_HEIGHT: f32 = 38.0;
 const STATUSBAR_HEIGHT: f32 = 24.0;
 
+/// What the rest of the window keeps when the channel table is split off to the right; the table
+/// takes the remainder. `split_right` gives the fraction to the old, left-hand side.
+const INSPECTOR_SPLIT: f32 = 0.56;
+
 /// How often the window repaints when nothing streams, just to notice state changes.
 const IDLE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often the dock layout is compared with the saved file, so dragging a divider does not
+/// rewrite it on every frame.
+const LAYOUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Frames the performance test discards first, while fonts, textures and shaders warm up.
 const PERF_WARMUP_SECONDS: f64 = 2.0;
@@ -65,11 +73,15 @@ pub struct WindowSettings {
     /// A serial port to open right away.
     pub startup_serial: Option<SerialConfig>,
     pub startup_decoder: DecoderSpec,
+    /// Whether this run may write the layout. Screenshot and performance runs keep their hands
+    /// off the user's saved window.
+    pub persist_layout: bool,
 }
 
-/// Tabs of the dock area.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Tab {
+/// Tabs of the dock area. The names are part of `layout.json`: renaming one drops the saved
+/// layout, which is the intended way to retire a tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Tab {
     Connections,
     Waveform,
     Xy,
@@ -116,9 +128,10 @@ impl Tab {
     }
 }
 
-/// The layout the window starts with, with `initial_tab` selected if it names one.
-fn initial_dock(initial_tab: Option<&str>) -> egui_dock::DockState<Tab> {
-    let mut dock = default_dock();
+/// The layout the window starts with: the one saved last time, with `initial_tab` selected if it
+/// names one; the default when there is nothing usable to restore.
+fn startup_dock(initial_tab: Option<&str>) -> egui_dock::DockState<Tab> {
+    let mut dock = crate::layout::load().unwrap_or_else(default_dock);
     if let Some(tab) = initial_tab.and_then(Tab::from_name)
         && let Some(path) = dock.find_tab(&tab)
     {
@@ -127,8 +140,8 @@ fn initial_dock(initial_tab: Option<&str>) -> egui_dock::DockState<Tab> {
     dock
 }
 
-/// The layout the window starts with.
-fn default_dock() -> egui_dock::DockState<Tab> {
+/// The layout a fresh window starts with.
+pub(crate) fn default_dock() -> egui_dock::DockState<Tab> {
     use egui_dock::NodeIndex;
 
     let mut dock = egui_dock::DockState::new(vec![
@@ -143,10 +156,37 @@ fn default_dock() -> egui_dock::DockState<Tab> {
     // `split_*` returns `[old, new]`, and the fraction is the share of whichever child comes
     // first in layout order: the new node for a split to the left, the old one otherwise.
     let [center, _sidebar] = tree.split_left(NodeIndex::root(), 0.18, vec![Tab::Connections]);
-    // The channel table needs about 430 points, whatever the window width.
-    let [center, _inspector] = tree.split_right(center, 0.56, vec![Tab::Inspector]);
+    // The channel table needs about 430 points at the default window size.
+    let [center, _inspector] = tree.split_right(center, INSPECTOR_SPLIT, vec![Tab::Inspector]);
     let [_center, _bottom] = tree.split_below(center, 0.68, vec![Tab::Send, Tab::Log]);
     dock
+}
+
+/// Whether the channel table is part of the layout.
+pub(crate) fn channels_panel_open(dock: &egui_dock::DockState<Tab>) -> bool {
+    dock.find_tab(&Tab::Inspector).is_some()
+}
+
+/// Closes or reopens the channel table. Reopening puts it back against the right edge, at the
+/// same proportion it starts with.
+pub(crate) fn set_channels_panel(dock: &mut egui_dock::DockState<Tab>, open: bool) {
+    if open == channels_panel_open(dock) {
+        return;
+    }
+    if open {
+        if dock.main_surface().root_node().is_none() {
+            // Nothing left to split: the table becomes the whole surface.
+            dock.push_to_focused_leaf(Tab::Inspector);
+        } else {
+            dock.main_surface_mut().split_right(
+                egui_dock::NodeIndex::root(),
+                INSPECTOR_SPLIT,
+                vec![Tab::Inspector],
+            );
+        }
+    } else if let Some(path) = dock.find_tab(&Tab::Inspector) {
+        dock.remove_tab(path);
+    }
 }
 
 pub fn run(
@@ -166,6 +206,7 @@ pub fn run(
         initial_tab: cli.tab.clone(),
         startup_serial,
         startup_decoder,
+        persist_layout: cli.screenshot.is_none() && cli.perf_test.is_none(),
     };
 
     let mut failure = String::from("没有尝试任何渲染后端");
@@ -495,6 +536,12 @@ pub struct EmbDbgApp {
     pending: Settings,
     /// What is currently in the settings file.
     saved: Settings,
+    /// Whether this run may write the layout; screenshot and performance runs may not.
+    persist_layout: bool,
+    /// The layout as last written, so a quiet session does not rewrite the file.
+    saved_layout: String,
+    /// When the layout was last compared with the file.
+    layout_checked: Instant,
 }
 
 /// A pending `--screenshot`, taken once its delay has passed.
@@ -559,12 +606,16 @@ impl EmbDbgApp {
             requested: false,
         });
 
+        let dock = startup_dock(initial_tab.as_deref());
+        let saved_layout = crate::layout::serialize(&dock).unwrap_or_default();
+        let persist_layout = settings.persist_layout;
+
         Ok(Self {
             events: engine.subscribe(),
             engine,
             backend,
             settings,
-            dock: initial_dock(initial_tab.as_deref()),
+            dock,
             connections: ConnectionsState::default(),
             channels: ChannelUi::default(),
             terminal: TerminalState::default(),
@@ -582,6 +633,9 @@ impl EmbDbgApp {
             settings_open: open_settings,
             pending,
             saved,
+            persist_layout,
+            saved_layout,
+            layout_checked: Instant::now(),
         })
     }
 
@@ -591,20 +645,6 @@ impl EmbDbgApp {
             ui.label(RichText::new("embdbg").strong().size(15.0));
             ui.separator();
 
-            let running = self.engine.simulator_running();
-            let (code, text) = if running {
-                (outline::PLAYER_STOP, "停止模拟信号源")
-            } else {
-                (outline::PLAYER_PLAY, "启动模拟信号源")
-            };
-            if ui.add(Button::new(icon_label(code, text, 13.5))).clicked() {
-                if running {
-                    self.engine.stop_simulator();
-                } else {
-                    self.engine
-                        .start_simulator(self.connections.simulator_config());
-                }
-            }
             if ui
                 .add(Button::new(icon_label(outline::ERASER, "清空数据", 13.5)))
                 .clicked()
@@ -615,12 +655,27 @@ impl EmbDbgApp {
 
             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(theme::SPACE_2);
-                ui.label(RichText::new(&self.backend).small().color(theme::FG_DIM));
-                ui.separator();
                 let gear = Button::new(fonts::icon(outline::SETTINGS, 16.0));
                 if ui.add(gear).on_hover_text("设置").clicked() {
                     self.settings_open = !self.settings_open;
                 }
+                ui.separator();
+                let open = channels_panel_open(&self.dock);
+                let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR_RIGHT, "通道", 13.5))
+                    .selected(open);
+                if ui
+                    .add(toggle)
+                    .on_hover_text(if open {
+                        "隐藏右侧的通道面板"
+                    } else {
+                        "显示右侧的通道面板"
+                    })
+                    .clicked()
+                {
+                    set_channels_panel(&mut self.dock, !open);
+                }
+                ui.separator();
+                ui.label(RichText::new(&self.backend).small().color(theme::FG_DIM));
             });
         });
     }
@@ -715,6 +770,8 @@ impl EmbDbgApp {
         };
         egui_dock::DockArea::new(dock)
             .style(egui_dock::Style::from_egui(ui.style()))
+            // The tab's own close button is enough; a second one for the whole pane is noise.
+            .show_leaf_close_all_buttons(false)
             .show_inside(ui, &mut viewer);
     }
 
@@ -827,8 +884,9 @@ impl egui_dock::TabViewer for DockViewer<'_> {
                 panels::histogram::ui(ui, &shared, self.histogram);
             }
             Tab::Terminal => {
+                let active = self.engine.active();
                 let shared = self.engine.active_shared();
-                panels::terminal::ui(ui, &shared, self.terminal);
+                panels::terminal::ui(ui, self.engine, active.as_deref(), &shared, self.terminal);
             }
             Tab::Hex => {
                 let shared = self.engine.active_shared();
@@ -849,9 +907,10 @@ impl egui_dock::TabViewer for DockViewer<'_> {
         }
     }
 
-    /// Nothing reopens a closed tab yet, so the close buttons stay hidden.
-    fn is_closeable(&self, _tab: &Tab) -> bool {
-        false
+    /// Only the channel table can be closed, from its tab or from the toolbar; the data views
+    /// stay. `set_channels_panel` reopens it.
+    fn is_closeable(&self, tab: &Tab) -> bool {
+        matches!(tab, Tab::Inspector)
     }
 }
 
@@ -1010,6 +1069,9 @@ impl eframe::App for EmbDbgApp {
             .frame(Frame::new().fill(theme::BG_WINDOW))
             .show(ui, |ui| self.show_dock(ui));
 
+        // The dock has taken this frame's clicks and drags by now.
+        self.save_layout(false);
+
         let ctx = ui.ctx().clone();
         self.handle_settings(&ctx);
 
@@ -1022,6 +1084,11 @@ impl eframe::App for EmbDbgApp {
         }
         self.request_screenshot_when_due(&ctx);
         self.schedule_repaint(&ctx);
+    }
+
+    /// The last chance to keep a layout the one-second check has not written yet.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_layout(true);
     }
 }
 
@@ -1061,6 +1128,31 @@ impl EmbDbgApp {
                     (self.pending.max_fps > 0.0).then_some(self.pending.max_fps);
             }
             Err(error) => self.log.error(format!("保存设置失败：{error}")),
+        }
+    }
+
+    /// Writes the dock layout when it has changed since the last check: a tab moved, the channel
+    /// table closed, a divider dragged. At most once a second, and never for screenshot or
+    /// performance runs.
+    fn save_layout(&mut self, force: bool) {
+        if !self.persist_layout {
+            return;
+        }
+        if !force && self.layout_checked.elapsed() < LAYOUT_CHECK_INTERVAL {
+            return;
+        }
+        self.layout_checked = Instant::now();
+        let Ok(text) = crate::layout::serialize(&self.dock) else {
+            return;
+        };
+        if !force && text == self.saved_layout {
+            return;
+        }
+        // Remember the text even when writing fails: a full disk must not make the app retry
+        // every second. The next real change tries again.
+        self.saved_layout = text.clone();
+        if let Err(error) = crate::layout::write(&text) {
+            self.log.error(format!("保存窗口布局失败：{error}"));
         }
     }
 
@@ -1123,6 +1215,31 @@ mod tests {
         ];
         expected.sort_by_key(|tab| tab.title());
         assert_eq!(tabs, expected);
+    }
+
+    #[test]
+    fn the_channel_panel_closes_and_reopens_on_the_right() {
+        let mut dock = default_dock();
+        assert!(channels_panel_open(&dock));
+
+        set_channels_panel(&mut dock, false);
+        assert!(!channels_panel_open(&dock));
+        // Everything else stays in the layout.
+        let tabs: Vec<Tab> = dock.main_surface().tabs().copied().collect();
+        assert_eq!(tabs.len(), 9);
+        assert!(!tabs.contains(&Tab::Inspector));
+
+        set_channels_panel(&mut dock, true);
+        assert!(channels_panel_open(&dock));
+        // It comes back against the right edge, where it started.
+        let tree = dock.main_surface();
+        let root = egui_dock::NodeIndex::root();
+        assert!(tree[root].is_horizontal());
+        let right: Vec<Tab> = tree[root.right()]
+            .tabs()
+            .map(<[Tab]>::to_vec)
+            .unwrap_or_default();
+        assert_eq!(right, [Tab::Inspector]);
     }
 
     #[test]

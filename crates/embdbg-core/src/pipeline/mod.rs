@@ -6,6 +6,7 @@ pub mod decoder;
 pub mod framing;
 pub mod session;
 pub mod set;
+pub mod terminal;
 pub mod traffic;
 
 pub use batch::{BatchLog, TimeAxis};
@@ -14,4 +15,5 @@ pub use decoder::{Decoded, Decoder, DecoderSpec};
 pub use framing::{Framed, Framer, Framing};
 pub use session::{DataSession, SessionConfig, SessionShared};
 pub use set::ChannelSet;
+pub use terminal::Terminal;
 pub use traffic::{ByteLog, Direction, LineLog, TrafficStats};

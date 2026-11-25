@@ -10,5 +10,6 @@ tokio = { workspace = true }
 parking_lot = { workspace = true }
 serialport = { workspace = true }
 realfft = { workspace = true }
+vt100 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

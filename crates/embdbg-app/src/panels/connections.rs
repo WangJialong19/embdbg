@@ -1,10 +1,15 @@
-//! The sidebar: opening connections, choosing the active one, and switching its protocol.
+//! The connection panel: one interface is picked at a time, and only its controls show.
+//!
+//! This follows the pattern VOFA+ uses: a transport selector at the top, the parameters of that
+//! transport below it, and the list of open connections underneath. Only the chosen interface
+//! takes space, so the panel stays readable as more transports are added.
 
-use egui::{Button, ComboBox, RichText, Ui, vec2};
+use egui::{Button, ComboBox, Grid, RichText, Ui, vec2};
 use embdbg_core::engine::{ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::DecoderSpec;
 use embdbg_core::transport::{
-    PortInfo, SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, list_ports,
+    FlowChoice, ParityChoice, PortInfo, SerialConfig, SimulatorConfig, TcpClientConfig,
+    TcpServerConfig, list_ports,
 };
 
 use crate::fonts::{icon, icon_label};
@@ -21,14 +26,52 @@ const BAUDS: [u32; 7] = [9_600, 19_200, 38_400, 57_600, 115_200, 921_600, 3_000_
 /// Batches the simulator delivers per second at any rate.
 const BATCH_HZ: f64 = 50.0;
 
+/// What the panel is set up to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Interface {
+    #[default]
+    Serial,
+    TcpClient,
+    TcpServer,
+    Simulator,
+}
+
+impl Interface {
+    /// The name in the selector.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Serial => "串口",
+            Self::TcpClient => "TCP 客户端",
+            Self::TcpServer => "TCP 服务器",
+            Self::Simulator => "模拟信号源",
+        }
+    }
+
+    /// One line under the selector.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Serial => "USB 转串口、COM 口",
+            Self::TcpClient => "主动连接远端地址",
+            Self::TcpServer => "在本机监听，等待设备接入",
+            Self::Simulator => "没有硬件时产生的 8 通道波形",
+        }
+    }
+}
+
 /// What the user picked on the sidebar. Kept across frames.
 pub struct ConnectionsState {
+    /// Which form the panel shows.
+    pub interface: Interface,
     /// Index into [`RATES`].
     pub rate: usize,
     /// Serial ports known at the last refresh.
     pub ports: Vec<PortInfo>,
     pub port: String,
     pub baud: u32,
+    pub data_bits: u8,
+    pub parity: ParityChoice,
+    pub stop_bits: u8,
+    pub flow: FlowChoice,
     pub host: String,
     pub client_port: String,
     pub bind: String,
@@ -42,10 +85,15 @@ impl Default for ConnectionsState {
             .first()
             .map_or_else(String::new, |port| port.name.clone());
         Self {
+            interface: Interface::Serial,
             rate: RATES.len() - 1,
             ports,
             port,
             baud: 115_200,
+            data_bits: 8,
+            parity: ParityChoice::None,
+            stop_bits: 1,
+            flow: FlowChoice::None,
             host: "127.0.0.1".to_owned(),
             client_port: "8080".to_owned(),
             bind: "0.0.0.0".to_owned(),
@@ -61,6 +109,17 @@ impl ConnectionsState {
             batch_hz: BATCH_HZ,
         }
     }
+
+    fn serial_config(&self) -> SerialConfig {
+        SerialConfig {
+            port: self.port.clone(),
+            baud: self.baud,
+            data_bits: self.data_bits,
+            parity: self.parity,
+            stop_bits: self.stop_bits,
+            flow: self.flow,
+        }
+    }
 }
 
 /// What the panel did, so a failure can be written to the log.
@@ -73,136 +132,32 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
     let mut action = Action::None;
 
     ui.add_space(SPACE_2);
-    ui.label(RichText::new("模拟信号源").strong());
-    let running = engine.simulator_running();
-    let (button_icon, button_text) = if running {
-        (outline::PLAYER_STOP, "停止模拟信号源")
-    } else {
-        (outline::PLAYER_PLAY, "启动模拟信号源")
-    };
-    let button = Button::new(icon_label(button_icon, button_text, 13.5))
-        .min_size(vec2(ui.available_width(), 0.0))
-        .fill(if running {
-            theme::BG_HOVER
-        } else {
-            theme::ACCENT.gamma_multiply(0.30)
-        });
-    if ui.add(button).clicked() {
-        if running {
-            engine.stop_simulator();
-        } else {
-            engine.start_simulator(state.simulator_config());
-        }
-    }
-    ComboBox::from_id_salt("simulator-rate")
-        .selected_text(format_rate(RATES[state.rate], "样本/s"))
+    ui.label(RichText::new("协议与连接").strong());
+
+    ui.add_space(SPACE_2);
+    ui.label(RichText::new("数据接口").small().color(FG_DIM));
+    ComboBox::from_id_salt("interface")
+        .width(ui.available_width())
+        .selected_text(state.interface.label())
         .show_ui(ui, |ui| {
-            for (index, rate) in RATES.iter().enumerate() {
-                ui.selectable_value(&mut state.rate, index, format_rate(*rate, "样本/s"));
+            for interface in [
+                Interface::Serial,
+                Interface::TcpClient,
+                Interface::TcpServer,
+                Interface::Simulator,
+            ] {
+                ui.selectable_value(&mut state.interface, interface, interface.label());
             }
         });
+    ui.label(RichText::new(state.interface.hint()).small().color(FG_DIM));
 
-    ui.add_space(SPACE_2);
-    ui.separator();
-    ui.add_space(SPACE_2);
-    ui.label(RichText::new("新建串口").strong());
-    ui.horizontal(|ui| {
-        ComboBox::from_id_salt("serial-port")
-            .width((ui.available_width() - 40.0).max(80.0))
-            .selected_text(if state.port.is_empty() {
-                "选择端口".to_owned()
-            } else {
-                state.port.clone()
-            })
-            .show_ui(ui, |ui| {
-                for port in &state.ports {
-                    ui.selectable_value(&mut state.port, port.name.clone(), &port.name)
-                        .on_hover_text(&port.details);
-                }
-            });
-        if ui
-            .add(Button::new(icon(outline::REFRESH, 14.0)))
-            .on_hover_text("重新扫描串口")
-            .clicked()
-        {
-            state.ports = list_ports();
-            if !state.ports.iter().any(|port| port.name == state.port) {
-                state.port = state
-                    .ports
-                    .first()
-                    .map_or_else(String::new, |port| port.name.clone());
-            }
-        }
-    });
-    ui.horizontal(|ui| {
-        ComboBox::from_id_salt("serial-baud")
-            .selected_text(state.baud.to_string())
-            .show_ui(ui, |ui| {
-                for baud in BAUDS {
-                    ui.selectable_value(&mut state.baud, baud, baud.to_string());
-                }
-            });
-        let can_open = !state.port.is_empty();
-        if ui
-            .add_enabled(can_open, Button::new("打开"))
-            .on_disabled_hover_text("先选择端口")
-            .clicked()
-        {
-            let config = SerialConfig {
-                port: state.port.clone(),
-                baud: state.baud,
-                ..SerialConfig::default()
-            };
-            if let Err(error) = engine.open(TransportConfig::Serial(config)) {
-                action = Action::Failed(error);
-            }
-        }
-    });
-
-    ui.add_space(SPACE_2);
-    ui.label(RichText::new("新建 TCP 客户端").strong());
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut state.host).desired_width(90.0));
-        ui.label(":");
-        ui.add(egui::TextEdit::singleline(&mut state.client_port).desired_width(48.0));
-        if ui.button("连接").clicked() {
-            match parse_port(&state.client_port) {
-                Ok(port) => {
-                    let config = TcpClientConfig {
-                        host: state.host.clone(),
-                        port,
-                        connect_timeout_ms: 3000,
-                    };
-                    if let Err(error) = engine.open(TransportConfig::TcpClient(config)) {
-                        action = Action::Failed(error);
-                    }
-                }
-                Err(error) => action = Action::Failed(error),
-            }
-        }
-    });
-
-    ui.add_space(SPACE_2);
-    ui.label(RichText::new("新建 TCP 服务器").strong());
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut state.bind).desired_width(90.0));
-        ui.label(":");
-        ui.add(egui::TextEdit::singleline(&mut state.server_port).desired_width(48.0));
-        if ui.button("监听").clicked() {
-            match parse_port(&state.server_port) {
-                Ok(port) => {
-                    let config = TcpServerConfig {
-                        bind: state.bind.clone(),
-                        port,
-                    };
-                    if let Err(error) = engine.open(TransportConfig::TcpServer(config)) {
-                        action = Action::Failed(error);
-                    }
-                }
-                Err(error) => action = Action::Failed(error),
-            }
-        }
-    });
+    // Only the chosen interface takes space.
+    match state.interface {
+        Interface::Serial => serial_form(ui, engine, state, &mut action),
+        Interface::TcpClient => tcp_client_form(ui, engine, state, &mut action),
+        Interface::TcpServer => tcp_server_form(ui, engine, state, &mut action),
+        Interface::Simulator => simulator_form(ui, engine, state),
+    }
 
     ui.add_space(SPACE_3);
     ui.separator();
@@ -277,6 +232,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
         ui.label(RichText::new("当前连接的协议").strong());
         let mut spec = connection.decoder();
         ComboBox::from_id_salt("decoder")
+            .width(ui.available_width())
             .selected_text(decoder_label(spec))
             .show_ui(ui, |ui| {
                 for candidate in [
@@ -300,6 +256,259 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
     }
 
     action
+}
+
+/// Serial: the port, its line settings, and the button that opens it.
+fn serial_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: &mut Action) {
+    Grid::new("serial-params")
+        .num_columns(2)
+        .spacing([SPACE_2, SPACE_1])
+        .show(ui, |ui| {
+            ui.label("端口");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("serial-port")
+                    .width((ui.available_width() - 30.0).max(80.0))
+                    .selected_text(if state.port.is_empty() {
+                        "选择端口".to_owned()
+                    } else {
+                        state.port.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        for port in &state.ports {
+                            ui.selectable_value(&mut state.port, port.name.clone(), &port.name)
+                                .on_hover_text(&port.details);
+                        }
+                    });
+                if ui
+                    .add(Button::new(icon(outline::REFRESH, 14.0)))
+                    .on_hover_text("重新扫描串口")
+                    .clicked()
+                {
+                    state.ports = list_ports();
+                    if !state.ports.iter().any(|port| port.name == state.port) {
+                        state.port = state
+                            .ports
+                            .first()
+                            .map_or_else(String::new, |port| port.name.clone());
+                    }
+                }
+            });
+            ui.end_row();
+
+            ui.label("波特率");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("serial-baud")
+                    .width(90.0)
+                    .selected_text(state.baud.to_string())
+                    .show_ui(ui, |ui| {
+                        for baud in BAUDS {
+                            ui.selectable_value(&mut state.baud, baud, baud.to_string());
+                        }
+                    });
+            });
+            ui.end_row();
+
+            ui.label("数据位");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("data-bits")
+                    .width(90.0)
+                    .selected_text(state.data_bits.to_string())
+                    .show_ui(ui, |ui| {
+                        for bits in [5, 6, 7, 8] {
+                            ui.selectable_value(&mut state.data_bits, bits, bits.to_string());
+                        }
+                    });
+            });
+            ui.end_row();
+
+            ui.label("校验位");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("parity")
+                    .width(90.0)
+                    .selected_text(parity_label(state.parity))
+                    .show_ui(ui, |ui| {
+                        for parity in [ParityChoice::None, ParityChoice::Odd, ParityChoice::Even] {
+                            ui.selectable_value(&mut state.parity, parity, parity_label(parity));
+                        }
+                    });
+            });
+            ui.end_row();
+
+            ui.label("停止位");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("stop-bits")
+                    .width(90.0)
+                    .selected_text(state.stop_bits.to_string())
+                    .show_ui(ui, |ui| {
+                        for bits in [1, 2] {
+                            ui.selectable_value(&mut state.stop_bits, bits, bits.to_string());
+                        }
+                    });
+            });
+            ui.end_row();
+
+            ui.label("流控");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("flow")
+                    .width(90.0)
+                    .selected_text(flow_label(state.flow))
+                    .show_ui(ui, |ui| {
+                        for flow in [FlowChoice::None, FlowChoice::Software, FlowChoice::Hardware] {
+                            ui.selectable_value(&mut state.flow, flow, flow_label(flow));
+                        }
+                    });
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(SPACE_1);
+    let can_open = !state.port.is_empty();
+    let button = Button::new(icon_label(outline::PLUG_CONNECTED, "打开串口", 13.0))
+        .min_size(vec2(ui.available_width(), 0.0))
+        .fill(theme::ACCENT.gamma_multiply(0.30));
+    if ui
+        .add_enabled(can_open, button)
+        .on_disabled_hover_text("先选择端口")
+        .clicked()
+        && let Err(error) = engine.open(TransportConfig::Serial(state.serial_config()))
+    {
+        *action = Action::Failed(error);
+    }
+}
+
+/// TCP client: where to connect and the button that does it.
+fn tcp_client_form(
+    ui: &mut Ui,
+    engine: &Engine,
+    state: &mut ConnectionsState,
+    action: &mut Action,
+) {
+    Grid::new("tcp-client-params")
+        .num_columns(2)
+        .spacing([SPACE_2, SPACE_1])
+        .show(ui, |ui| {
+            ui.label("地址");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut state.host).desired_width(88.0));
+                ui.label(":");
+                ui.add(egui::TextEdit::singleline(&mut state.client_port).desired_width(46.0));
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(SPACE_1);
+    let button = Button::new(icon_label(outline::WORLD_WWW, "连接", 13.0))
+        .min_size(vec2(ui.available_width(), 0.0))
+        .fill(theme::ACCENT.gamma_multiply(0.30));
+    if ui.add(button).clicked() {
+        match parse_port(&state.client_port) {
+            Ok(port) => {
+                let config = TcpClientConfig {
+                    host: state.host.clone(),
+                    port,
+                    connect_timeout_ms: 3000,
+                };
+                if let Err(error) = engine.open(TransportConfig::TcpClient(config)) {
+                    *action = Action::Failed(error);
+                }
+            }
+            Err(error) => *action = Action::Failed(error),
+        }
+    }
+}
+
+/// TCP server: what to bind and the button that starts listening.
+fn tcp_server_form(
+    ui: &mut Ui,
+    engine: &Engine,
+    state: &mut ConnectionsState,
+    action: &mut Action,
+) {
+    Grid::new("tcp-server-params")
+        .num_columns(2)
+        .spacing([SPACE_2, SPACE_1])
+        .show(ui, |ui| {
+            ui.label("绑定");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut state.bind).desired_width(88.0));
+                ui.label(":");
+                ui.add(egui::TextEdit::singleline(&mut state.server_port).desired_width(46.0));
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(SPACE_1);
+    let button = Button::new(icon_label(outline::SERVER, "监听", 13.0))
+        .min_size(vec2(ui.available_width(), 0.0))
+        .fill(theme::ACCENT.gamma_multiply(0.30));
+    if ui.add(button).clicked() {
+        match parse_port(&state.server_port) {
+            Ok(port) => {
+                let config = TcpServerConfig {
+                    bind: state.bind.clone(),
+                    port,
+                };
+                if let Err(error) = engine.open(TransportConfig::TcpServer(config)) {
+                    *action = Action::Failed(error);
+                }
+            }
+            Err(error) => *action = Action::Failed(error),
+        }
+    }
+}
+
+/// The built-in generator: a stand-in for hardware.
+fn simulator_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) {
+    let running = engine.simulator_running();
+    let (button_icon, button_text) = if running {
+        (outline::PLAYER_STOP, "停止模拟信号源")
+    } else {
+        (outline::PLAYER_PLAY, "启动模拟信号源")
+    };
+    let button = Button::new(icon_label(button_icon, button_text, 13.0))
+        .min_size(vec2(ui.available_width(), 0.0))
+        .fill(if running {
+            theme::BG_HOVER
+        } else {
+            theme::ACCENT.gamma_multiply(0.30)
+        });
+    if ui.add(button).clicked() {
+        if running {
+            engine.stop_simulator();
+        } else {
+            engine.start_simulator(state.simulator_config());
+        }
+    }
+    ui.add_space(SPACE_1);
+    ComboBox::from_id_salt("simulator-rate")
+        .width(ui.available_width())
+        .selected_text(format_rate(RATES[state.rate], "样本/s"))
+        .show_ui(ui, |ui| {
+            for (index, rate) in RATES.iter().enumerate() {
+                ui.selectable_value(&mut state.rate, index, format_rate(*rate, "样本/s"));
+            }
+        });
+    ui.label(
+        RichText::new("8 通道 · JustFloat · 只进入波形类视图")
+            .small()
+            .color(FG_DIM),
+    );
+}
+
+fn parity_label(parity: ParityChoice) -> &'static str {
+    match parity {
+        ParityChoice::None => "无",
+        ParityChoice::Odd => "奇",
+        ParityChoice::Even => "偶",
+    }
+}
+
+fn flow_label(flow: FlowChoice) -> &'static str {
+    match flow {
+        FlowChoice::None => "无",
+        FlowChoice::Software => "软件",
+        FlowChoice::Hardware => "硬件",
+    }
 }
 
 fn decoder_label(spec: DecoderSpec) -> &'static str {
@@ -345,7 +554,21 @@ mod tests {
     }
 
     #[test]
-    fn every_decoder_has_a_legible_name() {
+    fn the_panel_starts_on_the_serial_form() {
+        assert_eq!(ConnectionsState::default().interface, Interface::Serial);
+    }
+
+    #[test]
+    fn every_interface_and_decoder_has_a_legible_name() {
+        for interface in [
+            Interface::Serial,
+            Interface::TcpClient,
+            Interface::TcpServer,
+            Interface::Simulator,
+        ] {
+            assert!(!interface.label().is_empty());
+            assert!(!interface.hint().is_empty());
+        }
         for spec in [
             DecoderSpec::Line,
             DecoderSpec::JustFloat,
@@ -353,5 +576,25 @@ mod tests {
         ] {
             assert!(!decoder_label(spec).is_empty());
         }
+    }
+
+    #[test]
+    fn serial_settings_reach_the_config() {
+        let state = ConnectionsState {
+            port: "COM9".to_owned(),
+            baud: 921_600,
+            data_bits: 7,
+            parity: ParityChoice::Even,
+            stop_bits: 2,
+            flow: FlowChoice::Hardware,
+            ..ConnectionsState::default()
+        };
+        let config = state.serial_config();
+        assert_eq!(config.port, "COM9");
+        assert_eq!(config.baud, 921_600);
+        assert_eq!(config.data_bits, 7);
+        assert_eq!(config.parity, ParityChoice::Even);
+        assert_eq!(config.stop_bits, 2);
+        assert_eq!(config.flow, FlowChoice::Hardware);
     }
 }

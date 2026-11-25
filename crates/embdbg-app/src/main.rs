@@ -1,9 +1,14 @@
 //! Program entry. `embdbg` opens the window; engine-only subcommands come later.
 
+// A release build is a window program: double-clicking it must not leave a console behind. Debug
+// builds keep the console so `cargo run` and the subcommands print where they are expected to.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod fonts;
 mod headless;
 mod icons;
+mod layout;
 mod logging;
 mod panels;
 mod plots;
@@ -113,6 +118,16 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    attach_parent_console();
+    let result = run();
+    if let Err(error) = &result {
+        // A window program has no console to print a startup failure to.
+        show_failure(&format!("{error:#}"));
+    }
+    result
+}
+
+fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     logging::init().context("初始化日志失败")?;
     logging::capture_panics();
@@ -214,3 +229,62 @@ fn parse_hex(text: &str) -> anyhow::Result<Vec<u8>> {
         })
         .collect()
 }
+
+/// A window program starts without a console. A headless subcommand run from a terminal still
+/// wants its output there, so borrow the parent's console when there is one; a double-click has
+/// no parent console, which is exactly when nothing should appear behind the window.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_parent_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+
+    // SAFETY: attaching a console touches no memory this process owns.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_parent_console() {}
+
+/// Shows a startup failure in a dialog, since a window program has no console to print it to.
+/// The log file has the details either way.
+#[cfg(all(windows, not(debug_assertions)))]
+fn show_failure(message: &str) {
+    use std::os::windows::ffi::OsStrExt;
+
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(
+            window: *mut core::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let (text, caption) = (wide(message), wide("embdbg 启动失败"));
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            0x0000_0010,
+        );
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn show_failure(_message: &str) {}
