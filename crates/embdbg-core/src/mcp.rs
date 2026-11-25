@@ -21,7 +21,7 @@ use crate::analysis::{FftAnalyzer, Window, histogram};
 use crate::engine::{Connection, ConnectionState, Engine, TransportConfig};
 use crate::pipeline::Direction;
 use crate::transport::{
-    SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, list_ports,
+    SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig, list_ports,
 };
 
 /// How many tool calls the activity feed keeps for the window.
@@ -415,6 +415,16 @@ impl McpService {
                     .ok_or_else(|| "TCP 服务器需要 tcp_port".to_owned())?;
                 TransportConfig::TcpServer(TcpServerConfig { bind, port })
             }
+            TransportKind::Udp => {
+                let port = params
+                    .udp_port
+                    .ok_or_else(|| "UDP 需要 udp_port（本地端口）".to_owned())?;
+                TransportConfig::Udp(UdpConfig {
+                    bind: params.bind.unwrap_or_else(|| "0.0.0.0".to_owned()),
+                    port,
+                    target: params.target.filter(|target| !target.trim().is_empty()),
+                })
+            }
             TransportKind::Simulator => TransportConfig::Simulator(SimulatorConfig::default()),
         };
         let id = self.engine.open(config)?;
@@ -666,6 +676,7 @@ enum TransportKind {
     Serial,
     TcpClient,
     TcpServer,
+    Udp,
     /// The built-in 8-channel signal generator, for testing the tools without hardware.
     Simulator,
 }
@@ -682,8 +693,12 @@ struct OpenParams {
     host: Option<String>,
     /// TCP port for a client or server.
     tcp_port: Option<u16>,
-    /// Local address a TCP server binds; default 0.0.0.0.
+    /// Local address a TCP server or UDP socket binds; default 0.0.0.0.
     bind: Option<String>,
+    /// Local port for a UDP socket.
+    udp_port: Option<u16>,
+    /// Where UDP sends go, as `host:port`; empty replies to the last sender.
+    target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]

@@ -16,7 +16,7 @@ use crate::clock::Clock;
 use crate::pipeline::{DataSession, DecoderSpec, SessionConfig, SessionShared};
 use crate::transport::{
     SIM_CHANNEL_NAMES, SIM_CHANNELS, SerialConfig, SerialEvent, Simulator, SimulatorConfig,
-    TcpClientConfig, TcpEvent, TcpServerConfig, serial, tcp,
+    TcpClientConfig, TcpEvent, TcpServerConfig, UdpConfig, UdpEvent, serial, tcp, udp,
 };
 
 /// Identifies a connection for as long as the program runs.
@@ -41,6 +41,7 @@ pub enum TransportConfig {
     Serial(SerialConfig),
     TcpClient(TcpClientConfig),
     TcpServer(TcpServerConfig),
+    Udp(UdpConfig),
 }
 
 impl TransportConfig {
@@ -51,6 +52,7 @@ impl TransportConfig {
             Self::Serial(_) => "串口",
             Self::TcpClient(_) => "TCP 客户端",
             Self::TcpServer(_) => "TCP 服务器",
+            Self::Udp(_) => "UDP",
         }
     }
 
@@ -63,6 +65,7 @@ impl TransportConfig {
             Self::Serial(config) => config.describe(),
             Self::TcpClient(config) => format!("{}:{}", config.host, config.port),
             Self::TcpServer(config) => format!("{}:{}", config.bind, config.port),
+            Self::Udp(config) => config.describe(),
         }
     }
 
@@ -299,6 +302,7 @@ impl Engine {
         let shared = Arc::new(SessionShared::with_capacity(self.capacity));
         let connection = Arc::new(Connection::new(id, config.clone(), shared));
 
+        let _enter = self.rt.enter();
         let opens_at_once = match &config {
             TransportConfig::Simulator(simulator) => {
                 self.spawn_simulator(&connection, *simulator);
@@ -315,6 +319,10 @@ impl Engine {
             TransportConfig::TcpServer(tcp_config) => {
                 self.spawn_tcp_server(&connection, tcp_config.clone());
                 false
+            }
+            TransportConfig::Udp(udp_config) => {
+                self.spawn_udp(&connection, udp_config.clone())?;
+                true
             }
         };
         if opens_at_once {
@@ -476,9 +484,7 @@ impl Engine {
         let events = self.events.clone();
         let connection = Arc::clone(connection);
         self.rt.spawn(async move {
-            let mut session = DataSession::new(SessionConfig {
-                decoder: *spec.read(),
-            });
+            let mut session = DataSession::new(SessionConfig::stream(*spec.read()));
             run_receiver(
                 &mut session,
                 &spec,
@@ -511,9 +517,7 @@ impl Engine {
         let events = self.events.clone();
         let connection = Arc::clone(connection);
         self.rt.spawn(async move {
-            let mut session = DataSession::new(SessionConfig {
-                decoder: *spec.read(),
-            });
+            let mut session = DataSession::new(SessionConfig::stream(*spec.read()));
             let mut flush = tokio::time::interval(IDLE_FLUSH_INTERVAL);
             let mut idle_watch: Option<(usize, Instant)> = None;
             loop {
@@ -533,7 +537,7 @@ impl Engine {
                         Some(TcpEvent::Data { t, bytes }) => {
                             let current = *spec.read();
                             if current != session.spec() {
-                                session.reconfigure(SessionConfig { decoder: current }, &shared);
+                                session.reconfigure(SessionConfig::stream(current), &shared);
                             }
                             session.on_bytes(t, &bytes, &shared);
                             version.fetch_add(1, Ordering::Release);
@@ -570,9 +574,7 @@ impl Engine {
         let version_for_sinks = Arc::clone(&self.version);
         let connection_for_sinks = Arc::clone(connection);
         let make_sink: tcp::ClientSinkFactory = Box::new(move |_client| {
-            let mut session = DataSession::new(SessionConfig {
-                decoder: *spec.read(),
-            });
+            let mut session = DataSession::new(SessionConfig::stream(*spec.read()));
             let spec = Arc::clone(&spec);
             let shared = Arc::clone(&shared_for_sinks);
             let version = Arc::clone(&version_for_sinks);
@@ -580,7 +582,7 @@ impl Engine {
             Box::new(move |bytes: &[u8]| {
                 let current = *spec.read();
                 if current != session.spec() {
-                    session.reconfigure(SessionConfig { decoder: current }, &shared);
+                    session.reconfigure(SessionConfig::stream(current), &shared);
                 }
                 session.on_bytes(clock.now(), bytes, &shared);
                 version.fetch_add(1, Ordering::Release);
@@ -613,6 +615,44 @@ impl Engine {
                 }
             }
         });
+    }
+
+    fn spawn_udp(&self, connection: &Arc<Connection>, config: UdpConfig) -> Result<(), String> {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<UdpEvent>();
+        let mut link = udp::spawn(&config, events_tx, self.clock)?;
+        connection.set_writer(link.writes.clone());
+        connection.set_closer(Box::new(move || link.stop()));
+
+        let shared = Arc::clone(&connection.shared);
+        let spec = Arc::clone(&connection.decoder);
+        let version = Arc::clone(&self.version);
+        let events = self.events.clone();
+        let connection = Arc::clone(connection);
+        self.rt.spawn(async move {
+            let mut session = DataSession::new(SessionConfig::datagram(*spec.read()));
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    UdpEvent::Data { t, bytes } => {
+                        let current = *spec.read();
+                        if current != session.spec() {
+                            session.reconfigure(SessionConfig::datagram(current), &shared);
+                        }
+                        session.on_bytes(t, &bytes, &shared);
+                        version.fetch_add(1, Ordering::Release);
+                        connection.mark_rx();
+                    }
+                    UdpEvent::Info(text) => {
+                        let _ = events
+                            .send(Event::Info(format!("{}：{text}", connection.config.kind())));
+                    }
+                    UdpEvent::Ended(reason) => {
+                        finish(&connection, reason, &events);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(())
     }
 }
 
@@ -653,7 +693,7 @@ async fn run_receiver<E>(
                     Ok((t, bytes)) => {
                         let current = *spec.read();
                         if current != session.spec() {
-                            session.reconfigure(SessionConfig { decoder: current }, shared);
+                            session.reconfigure(SessionConfig::stream(current), shared);
                         }
                         session.on_bytes(t, &bytes, shared);
                         version.fetch_add(1, Ordering::Release);

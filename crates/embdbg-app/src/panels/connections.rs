@@ -9,7 +9,7 @@ use embdbg_core::engine::{ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::DecoderSpec;
 use embdbg_core::transport::{
     FlowChoice, ParityChoice, PortInfo, SerialConfig, SimulatorConfig, TcpClientConfig,
-    TcpServerConfig, list_ports,
+    TcpServerConfig, UdpConfig, list_ports,
 };
 
 use crate::fonts::{icon, icon_label};
@@ -33,6 +33,7 @@ fn interface_label(interface: Interface) -> &'static str {
         Interface::Serial => "串口",
         Interface::TcpClient => "TCP 客户端",
         Interface::TcpServer => "TCP 服务器",
+        Interface::Udp => "UDP",
         Interface::Simulator => "模拟信号源",
     }
 }
@@ -43,6 +44,7 @@ fn interface_hint(interface: Interface) -> &'static str {
         Interface::Serial => "USB 转串口、COM 口",
         Interface::TcpClient => "主动连接远端地址",
         Interface::TcpServer => "在本机监听，等待设备接入",
+        Interface::Udp => "无连接收发，保留每条报文的边界",
         Interface::Simulator => "没有硬件时产生的 8 通道波形",
     }
 }
@@ -65,6 +67,8 @@ pub struct ConnectionsState {
     pub client_port: String,
     pub bind: String,
     pub server_port: String,
+    pub udp_port: String,
+    pub udp_target: String,
 }
 
 impl Default for ConnectionsState {
@@ -110,6 +114,8 @@ impl ConnectionsState {
             client_port: form.client_port,
             bind: form.bind,
             server_port: form.server_port,
+            udp_port: form.udp_port,
+            udp_target: form.udp_target,
         }
     }
 
@@ -127,6 +133,8 @@ impl ConnectionsState {
             client_port: self.client_port.clone(),
             bind: self.bind.clone(),
             server_port: self.server_port.clone(),
+            udp_port: self.udp_port.clone(),
+            udp_target: self.udp_target.clone(),
             simulator_rate: RATES[self.rate],
         }
     }
@@ -172,6 +180,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
                 Interface::Serial,
                 Interface::TcpClient,
                 Interface::TcpServer,
+                Interface::Udp,
                 Interface::Simulator,
             ] {
                 ui.selectable_value(&mut state.interface, interface, interface_label(interface));
@@ -188,6 +197,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
         Interface::Serial => serial_form(ui, engine, state, &mut action),
         Interface::TcpClient => tcp_client_form(ui, engine, state, &mut action),
         Interface::TcpServer => tcp_server_form(ui, engine, state, &mut action),
+        Interface::Udp => udp_form(ui, engine, state, &mut action),
         Interface::Simulator => simulator_form(ui, engine, state),
     }
 
@@ -481,6 +491,51 @@ fn tcp_server_form(
                     port,
                 };
                 if let Err(error) = engine.open(TransportConfig::TcpServer(config)) {
+                    *action = Action::Failed(error);
+                }
+            }
+            Err(error) => *action = Action::Failed(error),
+        }
+    }
+}
+
+/// UDP: a local port to listen on and an optional place to send.
+fn udp_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: &mut Action) {
+    Grid::new("udp-params")
+        .num_columns(2)
+        .spacing([SPACE_2, SPACE_1])
+        .show(ui, |ui| {
+            ui.label("本地端口");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut state.udp_port).desired_width(96.0));
+            });
+            ui.end_row();
+
+            ui.label("目标地址");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.udp_target)
+                        .desired_width(150.0)
+                        .hint_text("host:port，可留空"),
+                );
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(SPACE_1);
+    let button = Button::new(icon_label(outline::BROADCAST, "打开 UDP", 13.0))
+        .min_size(vec2(ui.available_width(), 0.0))
+        .fill(theme::ACCENT.gamma_multiply(0.30));
+    if ui.add(button).clicked() {
+        match parse_port(&state.udp_port) {
+            Ok(port) => {
+                let config = UdpConfig {
+                    bind: "0.0.0.0".to_owned(),
+                    port,
+                    target: Some(state.udp_target.clone())
+                        .filter(|target| !target.trim().is_empty()),
+                };
+                if let Err(error) = engine.open(TransportConfig::Udp(config)) {
                     *action = Action::Failed(error);
                 }
             }

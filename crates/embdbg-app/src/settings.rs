@@ -57,6 +57,7 @@ pub enum Interface {
     Serial,
     TcpClient,
     TcpServer,
+    Udp,
     Simulator,
 }
 
@@ -77,6 +78,10 @@ pub struct ConnectionForm {
     pub client_port: String,
     pub bind: String,
     pub server_port: String,
+    /// Local port a UDP socket listens on.
+    pub udp_port: String,
+    /// Where UDP sends go, as `host:port`; empty replies to the last sender.
+    pub udp_target: String,
     /// Samples per second for the simulator.
     pub simulator_rate: f64,
 }
@@ -95,6 +100,8 @@ impl Default for ConnectionForm {
             client_port: "8080".to_owned(),
             bind: "0.0.0.0".to_owned(),
             server_port: "8080".to_owned(),
+            udp_port: "9000".to_owned(),
+            udp_target: String::new(),
             simulator_rate: 1e6,
         }
     }

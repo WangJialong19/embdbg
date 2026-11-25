@@ -8,22 +8,39 @@ use std::sync::atomic::Ordering;
 use parking_lot::RwLock;
 
 use super::decoder::{Decoded, Decoder, DecoderSpec};
-use super::framing::Framer;
+use super::framing::{Framer, Framing};
 use super::set::ChannelSet;
 use super::terminal::Terminal;
 use super::traffic::{ByteLog, Direction, LineLog, TrafficStats};
 
 /// Per-connection settings that decide how bytes become data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionConfig {
     pub decoder: DecoderSpec,
+    /// A transport that keeps message boundaries (UDP) uses [`Framing::Datagram`]; streams
+    /// leave this `None` and let the decoder choose.
+    pub framing: Option<Framing>,
+}
+
+impl SessionConfig {
+    pub fn stream(decoder: DecoderSpec) -> Self {
+        Self {
+            decoder,
+            framing: None,
+        }
+    }
+
+    pub fn datagram(decoder: DecoderSpec) -> Self {
+        Self {
+            decoder,
+            framing: Some(Framing::Datagram),
+        }
+    }
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self {
-            decoder: DecoderSpec::Line,
-        }
+        Self::stream(DecoderSpec::Line)
     }
 }
 
@@ -75,13 +92,21 @@ impl SessionShared {
 pub struct DataSession {
     framer: Framer,
     decoder: Decoder,
+    /// The transport's framing choice, kept across protocol changes.
+    framing: Option<Framing>,
 }
 
 impl DataSession {
     pub fn new(config: SessionConfig) -> Self {
         Self {
-            framer: Framer::new(config.decoder.framing()),
+            framer: Framer::new(
+                config
+                    .framing
+                    .clone()
+                    .unwrap_or_else(|| config.decoder.framing()),
+            ),
             decoder: Decoder::new(config.decoder),
+            framing: config.framing,
         }
     }
 
@@ -99,7 +124,11 @@ impl DataSession {
     pub fn reconfigure(&mut self, config: SessionConfig, shared: &SessionShared) {
         if config.decoder != self.decoder.spec() {
             self.on_idle(f64::NAN, shared);
-            self.framer = Framer::new(config.decoder.framing());
+            self.framer = Framer::new(
+                self.framing
+                    .clone()
+                    .unwrap_or_else(|| config.decoder.framing()),
+            );
             self.decoder.set_spec(config.decoder);
         }
     }
@@ -213,9 +242,7 @@ mod tests {
     #[test]
     fn a_just_float_stream_split_anywhere_lands_in_the_channels() {
         let shared = SessionShared::new();
-        let mut session = DataSession::new(SessionConfig {
-            decoder: DecoderSpec::JustFloat,
-        });
+        let mut session = DataSession::new(SessionConfig::stream(DecoderSpec::JustFloat));
 
         // Three frames, fed one byte at a time: chunk boundaries must not matter.
         let mut stream = Vec::new();
@@ -240,9 +267,7 @@ mod tests {
     #[test]
     fn a_line_stream_reaches_the_terminal_and_a_partial_line_waits_for_idle() {
         let shared = SessionShared::new();
-        let mut session = DataSession::new(SessionConfig {
-            decoder: DecoderSpec::Line,
-        });
+        let mut session = DataSession::new(SessionConfig::stream(DecoderSpec::Line));
 
         session.on_bytes(1.0, b"AT\r\nOK\r", &shared);
         session.on_bytes(1.1, b"\n+CMS ERROR: 3\r\nTAIL", &shared);
@@ -275,9 +300,7 @@ mod tests {
     #[test]
     fn garbage_frames_are_counted_but_harmless() {
         let shared = SessionShared::new();
-        let mut session = DataSession::new(SessionConfig {
-            decoder: DecoderSpec::JustFloat,
-        });
+        let mut session = DataSession::new(SessionConfig::stream(DecoderSpec::JustFloat));
         // A stream of random bytes without a tail stays pending, then is dropped past the limit.
         session.on_bytes(0.0, &[0x42; 100], &shared);
         assert_eq!(shared.channels.read().frames(), 0);
@@ -287,9 +310,7 @@ mod tests {
     #[test]
     fn sample_rate_comes_from_the_timestamps() {
         let shared = SessionShared::new();
-        let mut session = DataSession::new(SessionConfig {
-            decoder: DecoderSpec::JustFloat,
-        });
+        let mut session = DataSession::new(SessionConfig::stream(DecoderSpec::JustFloat));
         let frame = just_float(&[1.0]);
         // Ten frames, one every 10 ms: 100 samples per second.
         for i in 0..10 {
