@@ -211,6 +211,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
         ui.label(RichText::new("还没有连接").small().color(FG_DIM));
     }
     let mut close: Option<u64> = None;
+    let mut remove: Option<u64> = None;
     for connection in connections {
         let selected = active == Some(connection.id);
         ui.horizontal(|ui| {
@@ -247,6 +248,14 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
             {
                 close = Some(connection.id);
             }
+            if !is_open
+                && ui
+                    .add(Button::new(icon_label(outline::TRASH, "移除", 12.0)).small())
+                    .on_hover_text("从列表里删掉，数据也一起清掉")
+                    .clicked()
+            {
+                remove = Some(connection.id);
+            }
             if matches!(connection.config, TransportConfig::TcpServer(_)) {
                 ui.label(
                     RichText::new(format!("{} 个客户端", connection.clients()))
@@ -265,6 +274,9 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
     }
     if let Some(id) = close {
         engine.close(id);
+    }
+    if let Some(id) = remove {
+        engine.remove(id);
     }
 
     if let Some(connection) = engine.active() {

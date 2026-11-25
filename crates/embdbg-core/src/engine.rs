@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -223,7 +223,6 @@ pub struct Engine {
     empty: Arc<SessionShared>,
     events: broadcast::Sender<Event>,
     version: Arc<AtomicU64>,
-    simulator_open: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -240,7 +239,6 @@ impl Engine {
             empty: Arc::new(SessionShared::with_capacity(capacity)),
             events: broadcast::channel(EVENT_CAPACITY).0,
             version: Arc::new(AtomicU64::new(0)),
-            simulator_open: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -329,6 +327,9 @@ impl Engine {
             connection.set_state(ConnectionState::Open);
         }
 
+        // Opening the same thing again replaces what is left of a closed or failed session for
+        // it, instead of stacking one row per attempt.
+        self.forget_stale(&config);
         self.connections.write().insert(id, Arc::clone(&connection));
         *self.active.write() = Some(id);
         self.emit(Event::Info(format!(
@@ -337,6 +338,44 @@ impl Engine {
             config.describe()
         )));
         Ok(id)
+    }
+
+    /// Drops closed and failed connections for the same transport, and their data with them.
+    fn forget_stale(&self, config: &TransportConfig) {
+        let stale: Vec<ConnectionId> = self
+            .connections
+            .read()
+            .iter()
+            .filter(|(_, connection)| {
+                connection.config == *config
+                    && matches!(
+                        connection.state(),
+                        ConnectionState::Closed | ConnectionState::Failed(_)
+                    )
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.remove(id);
+        }
+    }
+
+    /// Stops a connection and takes it out of the list, data included. Closing alone keeps the
+    /// entry so its data can still be read; this is for tidying up.
+    pub fn remove(&self, id: ConnectionId) {
+        let removed = self.connections.write().remove(&id);
+        let Some(connection) = removed else {
+            return;
+        };
+        connection.stop();
+        {
+            let mut active = self.active.write();
+            if *active == Some(id) {
+                *active = self.connections.read().keys().next_back().copied();
+            }
+        }
+        self.emit(Event::Info(format!("{} 已移除", connection.config.kind())));
+        self.version.fetch_add(1, Ordering::Release);
     }
 
     /// Stops a connection. It stays in the list, so its data can still be read.
@@ -371,17 +410,17 @@ impl Engine {
     }
 
     pub fn simulator_running(&self) -> bool {
-        self.simulator_open.load(Ordering::Acquire)
+        self.connections.read().values().any(|connection| {
+            matches!(connection.config, TransportConfig::Simulator(_))
+                && connection.state().is_open()
+        })
     }
 
     /// Starts the built-in signal generator, replacing a running one.
     pub fn start_simulator(&self, config: SimulatorConfig) {
         self.stop_simulator();
         match self.open(TransportConfig::Simulator(config)) {
-            Ok(_) => {
-                self.simulator_open.store(true, Ordering::Release);
-                self.emit(Event::Simulator { running: true });
-            }
+            Ok(_) => self.emit(Event::Simulator { running: true }),
             Err(error) => self.emit(Event::Error(error)),
         }
     }
@@ -395,7 +434,6 @@ impl Engine {
             .cloned();
         if let Some(connection) = simulator {
             connection.stop();
-            self.simulator_open.store(false, Ordering::Release);
             self.emit(Event::Simulator { running: false });
         }
     }
@@ -819,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn restarting_the_simulator_close_the_old_connection() {
+    fn restarting_the_simulator_replaces_the_old_connection() {
         open_runtime().block_on(async {
             let engine = Engine::new(Handle::current(), CAPACITY);
             let slow = SimulatorConfig {
@@ -830,10 +868,12 @@ mod tests {
             let first = engine.connections()[0].clone();
             engine.start_simulator(slow);
             let connections = engine.connections();
-            assert_eq!(connections.len(), 2);
+            // The closed simulator is replaced, not stacked.
+            assert_eq!(connections.len(), 1);
+            assert_ne!(connections[0].id, first.id);
             assert_eq!(first.state(), ConnectionState::Closed);
-            assert_eq!(connections[1].state(), ConnectionState::Open);
-            assert_eq!(engine.active_id(), Some(connections[1].id));
+            assert_eq!(connections[0].state(), ConnectionState::Open);
+            assert_eq!(engine.active_id(), Some(connections[0].id));
             assert!(engine.simulator_running());
         });
     }
@@ -929,6 +969,52 @@ mod tests {
             let last = lines.lines().last().unwrap();
             assert_eq!(last.text, "ping");
             engine.close(id);
+        });
+    }
+
+    #[test]
+    fn reopening_the_same_transport_replaces_a_closed_entry() {
+        let runtime = open_runtime();
+        let engine = Engine::new(runtime.handle().clone(), CAPACITY);
+        runtime.block_on(async {
+            let config = TransportConfig::Simulator(SimulatorConfig::default());
+            let first = engine.open(config.clone()).unwrap();
+            engine.close(first);
+            assert_eq!(engine.connections().len(), 1);
+            // Opening the same target again replaces the closed row instead of stacking one.
+            let second = engine.open(config).unwrap();
+            assert_eq!(engine.connections().len(), 1);
+            assert!(engine.connection(first).is_none());
+            assert!(engine.connection(second).is_some());
+            engine.close(second);
+        });
+    }
+
+    #[test]
+    fn removing_a_connection_drops_it_and_picks_another_active_one() {
+        let runtime = open_runtime();
+        let engine = Engine::new(runtime.handle().clone(), CAPACITY);
+        runtime.block_on(async {
+            let first = engine
+                .open(TransportConfig::Simulator(SimulatorConfig::default()))
+                .unwrap();
+            let second = engine
+                .open(TransportConfig::Simulator(SimulatorConfig {
+                    sample_rate: 100_000.0,
+                    ..SimulatorConfig::default()
+                }))
+                .unwrap();
+            assert_eq!(engine.connections().len(), 2);
+            assert_eq!(engine.active_id(), Some(second));
+
+            engine.remove(second);
+            assert_eq!(engine.connections().len(), 1);
+            assert_eq!(engine.active_id(), Some(first));
+
+            engine.remove(first);
+            assert_eq!(engine.connections().len(), 0);
+            assert_eq!(engine.active_id(), None);
+            assert_eq!(engine.active_shared().channels.read().channels().len(), 0);
         });
     }
 
