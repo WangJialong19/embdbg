@@ -1,0 +1,14 @@
+[package]
+name = "embdbg-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+serialport = { workspace = true }
+realfft = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

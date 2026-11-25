@@ -1,0 +1,28 @@
+[package]
+name = "embdbg-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "embdbg"
+path = "src/main.rs"
+
+[dependencies]
+embdbg-core = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }
+eframe = { workspace = true }
+egui_dock = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+directories = "6"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = "0.2"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+png = "0.17"

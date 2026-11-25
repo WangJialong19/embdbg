@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/embdbg-core", "crates/embdbg-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+embdbg-core = { path = "crates/embdbg-core" }
+
+# egui has no 1.0 and ships breaking changes every 2–3 months.
+# Pin exactly and upgrade as a deliberate, separate step.
+egui = "=0.37.0"
+egui_extras = "=0.37.0"
+# Both renderers are compiled in (the default wgpu plus glow), so the user, or the
+# startup fallback, can pick one at runtime.
+eframe = { version = "=0.37.0", features = ["glow"] }
+egui_dock = "=0.22.0"
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "net",
+    "sync",
+    "time",
+    "fs",
+] }
+parking_lot = "0.12"
+serialport = "4.10"
+realfft = "3.5"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
