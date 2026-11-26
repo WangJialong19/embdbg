@@ -103,6 +103,16 @@ pub fn ui(
         );
         return None;
     };
+    if matches!(
+        connection.config,
+        embdbg_core::engine::TransportConfig::Modbus(_)
+    ) {
+        ui.label(
+            RichText::new("Modbus 连接目前只读：轮询结果直接进通道，发送功能还未开放。")
+                .color(FG_DIM),
+        );
+        return None;
+    }
 
     let mut send = false;
     ui.horizontal(|ui| {

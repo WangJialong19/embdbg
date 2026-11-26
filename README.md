@@ -58,7 +58,7 @@ target/release/embdbg.exe                # 空界面
 
 | 类别 | 工具 |
 |---|---|
-| 连接 | `list_serial_ports`、`open_connection`（serial / tcp-client / tcp-server / udp / websocket / mqtt / simulator）、`close_connection`、`list_connections` |
+| 连接 | `list_serial_ports`、`open_connection`（serial / tcp-client / tcp-server / udp / websocket / mqtt / modbus-tcp / modbus-rtu / simulator）、`close_connection`、`list_connections` |
 | 收发 | `send`、`read_lines`、`read_terminal`、`wait_for`、`send_and_wait` |
 | 分析 | `list_channels`、`read_samples`、`get_fft`、`get_histogram`、`get_stats` |
 | 会话 | `screenshot`（仅窗口模式：把 PNG 存到临时目录并返回路径） |
@@ -117,14 +117,14 @@ tools/measure.ps1 内存/CPU 采样脚本
 - [x] **M0 骨架**：workspace、tokio 与 eframe 集成、主题与中文字体、停靠布局、自绘波形图、模拟信号源、渲染后端选择与回退、设置窗口、截图与性能自检。
 - [x] **M1 数据主链路**：串口与 TCP 客户端/服务器、JustFloat/JustInt/行协议、波形/X-Y/频谱/直方图、终端与十六进制视图、发送面板（文本/HEX/换行/定时/历史）。
   - 串口已实机验证：CH340（COM5，115200）的 Linux 控制台 + 1 Hz GPS/CAN 日志，终端与十六进制视图、无界面收发与统计均正常。
-  - 连接面板按 VOFA 的方式组织：顶部「数据接口」选择串口 / TCP 客户端 / TCP 服务器 / UDP / WebSocket / MQTT / 模拟信号源，只显示所选接口的参数，再往下的连接列表与协议不变。
+  - 连接面板按 VOFA 的方式组织：顶部「数据接口」选择串口 / TCP 客户端 / TCP 服务器 / UDP / WebSocket / MQTT / Modbus TCP / Modbus RTU / 模拟信号源，只显示所选接口的参数，再往下的连接列表与协议不变。
   - 终端是 VT100 仿真：ANSI 颜色、光标、回车覆盖整行、滚轮回看历史、按键直通（方向键、Ctrl 组合、粘贴），输入法候选窗跟随光标；鼠标拖选或双击选词后 Ctrl+Shift+C 复制，选中期间画面暂停刷新，点击恢复。
   - 窗口布局会记住：页签位置、活动页签、分栏比例、通道面板的开关都存在 `%LOCALAPPDATA%\embdbg\layout.json`，下次启动原样恢复。
   - 连接表单（接口、端口、波特率、数据位/校验/停止位/流控、TCP 地址）与发送宏存入 `config.toml`，重启后还在。
 - [x] **M2 MCP**：rmcp 3.11 服务、15 个工具、stdio 桥、命名管道接管窗口、无界面模式、AI 活动页签与截图工具。
   - 已用脚本端到端验证两条路径：无窗口时进程内服务；有窗口时 `embdbg mcp` 接管会话，工具调用会出现在界面的「AI」页签里。
   - 还需用真实 AI 客户端（ZCode）走一遍工具调用，并把"AI 写操作"的权限开关放到 M3 的网络工具里一起做。
-- [ ] **M3 网络**（进行中）：UDP、WebSocket、MQTT 已接入（界面、MCP 工具、数据报/消息分帧）；Modbus 与网络小工具待做。
+- [ ] **M3 网络**（进行中）：UDP、WebSocket、MQTT、Modbus TCP/RTU 主站已接入；Ping/端口扫描/DNS/HTTP 等网络小工具待做。
 - [ ] **M4 WASM 插件**。
 - [ ] **M5 打磨发布**。
 

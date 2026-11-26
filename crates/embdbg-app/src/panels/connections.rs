@@ -4,12 +4,13 @@
 //! transport below it, and the list of open connections underneath. Only the chosen interface
 //! takes space, so the panel stays readable as more transports are added.
 
-use egui::{Button, ComboBox, Grid, RichText, Ui, vec2};
+use egui::{Button, ComboBox, DragValue, Grid, RichText, Ui, vec2};
 use embdbg_core::engine::{ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::DecoderSpec;
 use embdbg_core::transport::{
-    FlowChoice, MqttConfig, ParityChoice, PortInfo, SerialConfig, SimulatorConfig, TcpClientConfig,
-    TcpServerConfig, UdpConfig, WsConfig, list_ports,
+    FlowChoice, ModbusBlock, ModbusConfig, ModbusEndpoint, MqttConfig, ParityChoice, PortInfo,
+    SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig, WsConfig,
+    list_ports,
 };
 
 use crate::fonts::{icon, icon_label};
@@ -36,6 +37,8 @@ fn interface_label(interface: Interface) -> &'static str {
         Interface::Udp => "UDP",
         Interface::WebSocket => "WebSocket",
         Interface::Mqtt => "MQTT",
+        Interface::ModbusTcp => "Modbus TCP",
+        Interface::ModbusRtu => "Modbus RTU",
         Interface::Simulator => "模拟信号源",
     }
 }
@@ -49,6 +52,8 @@ fn interface_hint(interface: Interface) -> &'static str {
         Interface::Udp => "无连接收发，保留每条报文的边界",
         Interface::WebSocket => "ws:// 或 wss:// 地址，文本与二进制都收",
         Interface::Mqtt => "订阅主题收数据，发送发布到另一个主题",
+        Interface::ModbusTcp => "按轮询表读寄存器，结果直接进通道",
+        Interface::ModbusRtu => "串口上的 Modbus 从站",
         Interface::Simulator => "没有硬件时产生的 8 通道波形",
     }
 }
@@ -80,6 +85,10 @@ pub struct ConnectionsState {
     pub mqtt_user: String,
     pub mqtt_password: String,
     pub mqtt_qos: u8,
+    pub modbus_slave: u8,
+    pub modbus_interval: u64,
+    pub modbus_port: String,
+    pub modbus_blocks: String,
 }
 
 impl Default for ConnectionsState {
@@ -134,6 +143,10 @@ impl ConnectionsState {
             mqtt_user: form.mqtt_user,
             mqtt_password: form.mqtt_password,
             mqtt_qos: form.mqtt_qos,
+            modbus_slave: form.modbus_slave,
+            modbus_interval: form.modbus_interval,
+            modbus_port: form.modbus_port,
+            modbus_blocks: form.modbus_blocks,
         }
     }
 
@@ -160,6 +173,10 @@ impl ConnectionsState {
             mqtt_user: self.mqtt_user.clone(),
             mqtt_password: self.mqtt_password.clone(),
             mqtt_qos: self.mqtt_qos,
+            modbus_slave: self.modbus_slave,
+            modbus_interval: self.modbus_interval,
+            modbus_port: self.modbus_port.clone(),
+            modbus_blocks: self.modbus_blocks.clone(),
             simulator_rate: RATES[self.rate],
         }
     }
@@ -208,6 +225,8 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
                 Interface::Udp,
                 Interface::WebSocket,
                 Interface::Mqtt,
+                Interface::ModbusTcp,
+                Interface::ModbusRtu,
                 Interface::Simulator,
             ] {
                 ui.selectable_value(&mut state.interface, interface, interface_label(interface));
@@ -227,6 +246,8 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
         Interface::Udp => udp_form(ui, engine, state, &mut action),
         Interface::WebSocket => ws_form(ui, engine, state, &mut action),
         Interface::Mqtt => mqtt_form(ui, engine, state, &mut action),
+        Interface::ModbusTcp => modbus_form(ui, engine, state, &mut action, true),
+        Interface::ModbusRtu => modbus_form(ui, engine, state, &mut action, false),
         Interface::Simulator => simulator_form(ui, engine, state),
     }
 
@@ -313,21 +334,29 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
         ui.separator();
         ui.add_space(SPACE_2);
         ui.label(RichText::new("当前连接的协议").strong());
-        let mut spec = connection.decoder();
-        ComboBox::from_id_salt("decoder")
-            .width(ui.available_width())
-            .selected_text(decoder_label(spec))
-            .show_ui(ui, |ui| {
-                for candidate in [
-                    DecoderSpec::Line,
-                    DecoderSpec::JustFloat,
-                    DecoderSpec::JustInt,
-                ] {
-                    ui.selectable_value(&mut spec, candidate, decoder_label(candidate));
-                }
-            });
-        if spec != connection.decoder() {
-            connection.set_decoder(spec);
+        if matches!(connection.config, TransportConfig::Modbus(_)) {
+            ui.label(
+                RichText::new("Modbus 数据直接进通道，不使用字节协议")
+                    .small()
+                    .color(FG_DIM),
+            );
+        } else {
+            let mut spec = connection.decoder();
+            ComboBox::from_id_salt("decoder")
+                .width(ui.available_width())
+                .selected_text(decoder_label(spec))
+                .show_ui(ui, |ui| {
+                    for candidate in [
+                        DecoderSpec::Line,
+                        DecoderSpec::JustFloat,
+                        DecoderSpec::JustInt,
+                    ] {
+                        ui.selectable_value(&mut spec, candidate, decoder_label(candidate));
+                    }
+                });
+            if spec != connection.decoder() {
+                connection.set_decoder(spec);
+            }
         }
         if matches!(connection.config, TransportConfig::Simulator(_)) {
             ui.label(
@@ -710,6 +739,154 @@ fn mqtt_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action:
             }
             Err(error) => *action = Action::Failed(error),
         }
+    }
+}
+
+/// Modbus: a polling table and where the slave is.
+fn modbus_form(
+    ui: &mut Ui,
+    engine: &Engine,
+    state: &mut ConnectionsState,
+    action: &mut Action,
+    tcp: bool,
+) {
+    Grid::new(if tcp {
+        "modbus-tcp-params"
+    } else {
+        "modbus-rtu-params"
+    })
+    .num_columns(2)
+    .spacing([SPACE_2, SPACE_1])
+    .show(ui, |ui| {
+        if tcp {
+            ui.label("服务器");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut state.host).desired_width(96.0));
+                ui.label(":");
+                ui.add(egui::TextEdit::singleline(&mut state.modbus_port).desired_width(50.0));
+            });
+            ui.end_row();
+        } else {
+            ui.label("串口");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("modbus-serial-port")
+                    .width(96.0)
+                    .selected_text(if state.port.is_empty() {
+                        "选择端口".to_owned()
+                    } else {
+                        state.port.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        for port in &state.ports {
+                            ui.selectable_value(&mut state.port, port.name.clone(), &port.name)
+                                .on_hover_text(&port.details);
+                        }
+                    });
+            });
+            ui.end_row();
+
+            ui.label("波特率");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("modbus-baud")
+                    .width(96.0)
+                    .selected_text(state.baud.to_string())
+                    .show_ui(ui, |ui| {
+                        for baud in BAUDS {
+                            ui.selectable_value(&mut state.baud, baud, baud.to_string());
+                        }
+                    });
+            });
+            ui.end_row();
+        }
+
+        ui.label("从站");
+        ui.horizontal(|ui| {
+            ui.add(DragValue::new(&mut state.modbus_slave).range(1..=247));
+        });
+        ui.end_row();
+
+        ui.label("周期");
+        ui.horizontal(|ui| {
+            ui.add(
+                DragValue::new(&mut state.modbus_interval)
+                    .range(50..=60_000)
+                    .suffix(" ms"),
+            );
+        });
+        ui.end_row();
+    });
+
+    ui.add_space(SPACE_1);
+    ui.label(
+        RichText::new("轮询表（每行：类型 起始 数量 [名称]）")
+            .small()
+            .color(FG_DIM),
+    );
+    ui.add(
+        egui::TextEdit::multiline(&mut state.modbus_blocks)
+            .font(egui::TextStyle::Monospace)
+            .desired_width(f32::INFINITY)
+            .desired_rows(4)
+            .hint_text("holding 0 8 电压"),
+    );
+
+    ui.add_space(SPACE_1);
+    let button = Button::new(icon_label(outline::PLUG_CONNECTED, "连接", 13.0))
+        .min_size(vec2(ui.available_width(), 0.0))
+        .fill(theme::ACCENT.gamma_multiply(0.30));
+    if !ui.add(button).clicked() {
+        return;
+    }
+    let blocks: Result<Vec<_>, String> = state
+        .modbus_blocks
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            ModbusBlock::parse_spec(line)
+                .map_err(|error| format!("轮询表第 {} 行：{error}", index + 1))
+        })
+        .collect();
+    let blocks = match blocks {
+        Ok(blocks) if blocks.is_empty() => {
+            *action = Action::Failed("轮询表不能为空".to_owned());
+            return;
+        }
+        Ok(blocks) => blocks,
+        Err(error) => {
+            *action = Action::Failed(error);
+            return;
+        }
+    };
+    let endpoint = if tcp {
+        match parse_port(&state.modbus_port) {
+            Ok(port) => ModbusEndpoint::Tcp {
+                host: state.host.clone(),
+                port,
+            },
+            Err(error) => {
+                *action = Action::Failed(error);
+                return;
+            }
+        }
+    } else {
+        if state.port.trim().is_empty() {
+            *action = Action::Failed("先选择串口".to_owned());
+            return;
+        }
+        ModbusEndpoint::Rtu {
+            port: state.port.clone(),
+            baud: state.baud,
+        }
+    };
+    let config = ModbusConfig {
+        endpoint,
+        slave: state.modbus_slave,
+        interval_ms: state.modbus_interval,
+        blocks,
+    };
+    if let Err(error) = engine.open(TransportConfig::Modbus(config)) {
+        *action = Action::Failed(error);
     }
 }
 

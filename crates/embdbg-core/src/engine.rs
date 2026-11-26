@@ -15,9 +15,9 @@ use crate::api::Event;
 use crate::clock::Clock;
 use crate::pipeline::{DataSession, DecoderSpec, SessionConfig, SessionShared};
 use crate::transport::{
-    MqttConfig, MqttEvent, SIM_CHANNEL_NAMES, SIM_CHANNELS, SerialConfig, SerialEvent, Simulator,
-    SimulatorConfig, TcpClientConfig, TcpEvent, TcpServerConfig, UdpConfig, UdpEvent, WsConfig,
-    WsEvent, mqtt, serial, tcp, udp, ws,
+    ModbusConfig, ModbusEvent, MqttConfig, MqttEvent, SIM_CHANNEL_NAMES, SIM_CHANNELS,
+    SerialConfig, SerialEvent, Simulator, SimulatorConfig, TcpClientConfig, TcpEvent,
+    TcpServerConfig, UdpConfig, UdpEvent, WsConfig, WsEvent, modbus, mqtt, serial, tcp, udp, ws,
 };
 
 /// Identifies a connection for as long as the program runs.
@@ -45,6 +45,7 @@ pub enum TransportConfig {
     Udp(UdpConfig),
     WebSocket(WsConfig),
     Mqtt(MqttConfig),
+    Modbus(ModbusConfig),
 }
 
 impl TransportConfig {
@@ -58,6 +59,7 @@ impl TransportConfig {
             Self::Udp(_) => "UDP",
             Self::WebSocket(_) => "WebSocket",
             Self::Mqtt(_) => "MQTT",
+            Self::Modbus(_) => "Modbus",
         }
     }
 
@@ -73,6 +75,7 @@ impl TransportConfig {
             Self::Udp(config) => config.describe(),
             Self::WebSocket(config) => config.describe(),
             Self::Mqtt(config) => config.describe(),
+            Self::Modbus(config) => config.describe(),
         }
     }
 
@@ -335,6 +338,10 @@ impl Engine {
             }
             TransportConfig::Mqtt(mqtt_config) => {
                 self.spawn_mqtt(&connection, mqtt_config.clone());
+                false
+            }
+            TransportConfig::Modbus(modbus_config) => {
+                self.spawn_modbus(&connection, modbus_config.clone())?;
                 false
             }
         };
@@ -727,6 +734,60 @@ impl Engine {
                 }
             }
         });
+    }
+
+    fn spawn_modbus(
+        &self,
+        connection: &Arc<Connection>,
+        config: ModbusConfig,
+    ) -> Result<(), String> {
+        if config.blocks.is_empty() {
+            return Err("Modbus 至少需要一个读取块".to_owned());
+        }
+        let channels = config.total_channels();
+        if channels == 0 {
+            return Err("Modbus 读取块的数量不能为 0".to_owned());
+        }
+        let names = config.channel_names();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ModbusEvent>();
+        let mut link = modbus::spawn(&config, events_tx, self.clock);
+        connection.set_closer(Box::new(move || link.stop()));
+
+        let shared = Arc::clone(&connection.shared);
+        let version = Arc::clone(&self.version);
+        let events = self.events.clone();
+        let connection = Arc::clone(connection);
+        self.rt.spawn(async move {
+            let mut named = false;
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    ModbusEvent::Samples { t, values } => {
+                        let mut set = shared.channels.write();
+                        set.push_frames(t, channels, &values);
+                        if !named {
+                            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                            set.set_default_names(&names);
+                            named = true;
+                        }
+                        drop(set);
+                        version.fetch_add(1, Ordering::Release);
+                        connection.mark_rx();
+                    }
+                    ModbusEvent::Info(text) => {
+                        if text.starts_with("已连接") {
+                            connection.set_state(ConnectionState::Open);
+                        }
+                        let _ = events
+                            .send(Event::Info(format!("{}：{text}", connection.config.kind())));
+                    }
+                    ModbusEvent::Ended(reason) => {
+                        finish(&connection, reason, &events);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(())
     }
 
     fn spawn_mqtt(&self, connection: &Arc<Connection>, config: MqttConfig) {

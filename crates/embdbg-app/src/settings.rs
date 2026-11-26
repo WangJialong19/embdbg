@@ -60,6 +60,8 @@ pub enum Interface {
     Udp,
     WebSocket,
     Mqtt,
+    ModbusTcp,
+    ModbusRtu,
     Simulator,
 }
 
@@ -93,6 +95,11 @@ pub struct ConnectionForm {
     pub mqtt_user: String,
     pub mqtt_password: String,
     pub mqtt_qos: u8,
+    /// Modbus poll table: slave id, interval, TCP port and the block lines.
+    pub modbus_slave: u8,
+    pub modbus_interval: u64,
+    pub modbus_port: String,
+    pub modbus_blocks: String,
     /// Samples per second for the simulator.
     pub simulator_rate: f64,
 }
@@ -120,6 +127,10 @@ impl Default for ConnectionForm {
             mqtt_user: String::new(),
             mqtt_password: String::new(),
             mqtt_qos: 0,
+            modbus_slave: 1,
+            modbus_interval: 500,
+            modbus_port: "502".to_owned(),
+            modbus_blocks: "holding 0 8".to_owned(),
             simulator_rate: 1e6,
         }
     }

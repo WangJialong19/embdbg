@@ -21,8 +21,8 @@ use crate::analysis::{FftAnalyzer, Window, histogram};
 use crate::engine::{Connection, ConnectionState, Engine, TransportConfig};
 use crate::pipeline::Direction;
 use crate::transport::{
-    MqttConfig, SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig,
-    WsConfig, list_ports,
+    ModbusBlock, ModbusConfig, ModbusEndpoint, MqttConfig, SerialConfig, SimulatorConfig,
+    TcpClientConfig, TcpServerConfig, UdpConfig, WsConfig, list_ports,
 };
 
 /// How many tool calls the activity feed keeps for the window.
@@ -450,6 +450,42 @@ impl McpService {
                     qos: params.qos.unwrap_or(0).min(2),
                 })
             }
+            TransportKind::ModbusTcp | TransportKind::ModbusRtu => {
+                let lines = params
+                    .blocks
+                    .unwrap_or_else(|| vec!["holding 0 8".to_owned()]);
+                let blocks: Vec<ModbusBlock> = lines
+                    .iter()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| ModbusBlock::parse_spec(line))
+                    .collect::<Result<_, _>>()?;
+                if blocks.is_empty() {
+                    return Err("Modbus 的 blocks 不能为空".to_owned());
+                }
+                let endpoint = if params.transport == TransportKind::ModbusTcp {
+                    let host = params
+                        .host
+                        .ok_or_else(|| "Modbus TCP 需要 host".to_owned())?;
+                    ModbusEndpoint::Tcp {
+                        host,
+                        port: params.tcp_port.unwrap_or(502),
+                    }
+                } else {
+                    let port = params
+                        .port
+                        .ok_or_else(|| "Modbus RTU 需要 port（串口名）".to_owned())?;
+                    ModbusEndpoint::Rtu {
+                        port,
+                        baud: params.baud.unwrap_or(9600),
+                    }
+                };
+                TransportConfig::Modbus(ModbusConfig {
+                    endpoint,
+                    slave: params.slave.unwrap_or(1).clamp(1, 247),
+                    interval_ms: params.interval_ms.unwrap_or(500).clamp(50, 60_000),
+                    blocks,
+                })
+            }
             TransportKind::Simulator => TransportConfig::Simulator(SimulatorConfig::default()),
         };
         let id = self.engine.open(config)?;
@@ -706,6 +742,10 @@ enum TransportKind {
     WebSocket,
     #[serde(rename = "mqtt")]
     Mqtt,
+    #[serde(rename = "modbus-tcp")]
+    ModbusTcp,
+    #[serde(rename = "modbus-rtu")]
+    ModbusRtu,
     /// The built-in 8-channel signal generator, for testing the tools without hardware.
     Simulator,
 }
@@ -738,6 +778,13 @@ struct OpenParams {
     publish: Option<String>,
     /// MQTT QoS level, 0 to 2.
     qos: Option<u8>,
+    /// Modbus unit / slave id, default 1.
+    slave: Option<u8>,
+    /// Modbus polling interval in milliseconds, default 500.
+    interval_ms: Option<u64>,
+    /// Modbus polling table: each line is `kind start count [name]`, for example
+    /// `holding 0 8 电压` or `input 0 4`.
+    blocks: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
@@ -1243,6 +1290,89 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(heard.as_deref(), Some("echo:hello"));
+    }
+
+    #[tokio::test]
+    async fn modbus_blocks_flow_through_the_tools() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A minimal Modbus TCP slave: every holding-register read returns start + i.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            loop {
+                let mut request = [0u8; 12];
+                if stream.read_exact(&mut request).await.is_err() {
+                    break;
+                }
+                let transaction = u16::from_be_bytes([request[0], request[1]]);
+                let unit = request[6];
+                let function = request[7];
+                let start = u16::from_be_bytes([request[8], request[9]]);
+                let count = u16::from_be_bytes([request[10], request[11]]);
+                let mut pdu = vec![function, (count * 2) as u8];
+                for offset in 0..count {
+                    pdu.extend_from_slice(&(start + offset).to_be_bytes());
+                }
+                let mut header = Vec::new();
+                header.extend_from_slice(&transaction.to_be_bytes());
+                header.extend_from_slice(&0u16.to_be_bytes());
+                header.extend_from_slice(&((pdu.len() + 1) as u16).to_be_bytes());
+                header.push(unit);
+                if stream.write_all(&header).await.is_err() || stream.write_all(&pdu).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let engine = Arc::new(Engine::new(tokio::runtime::Handle::current(), 1 << 16));
+        let service = McpService::new(Arc::clone(&engine));
+        let opened = service
+            .open_inner(OpenParams {
+                transport: TransportKind::ModbusTcp,
+                host: Some("127.0.0.1".to_owned()),
+                tcp_port: Some(addr.port()),
+                blocks: Some(vec!["holding 0 4".to_owned()]),
+                interval_ms: Some(100),
+                ..OpenParams::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(opened.kind, "Modbus");
+
+        let mut channels = None;
+        for _ in 0..50 {
+            let reply = service
+                .list_channels_inner(ConnectionParams {
+                    connection_id: Some(opened.id),
+                })
+                .unwrap()
+                .0;
+            if reply.channels.len() == 4 {
+                channels = Some(reply);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let channels = channels.expect("four registers should arrive");
+        assert_eq!(channels.channels[0].name, "holding[0]");
+        assert_eq!(channels.channels[3].name, "holding[3]");
+
+        let samples = service
+            .read_samples_inner(ReadSamplesParams {
+                connection_id: Some(opened.id),
+                channel: 2,
+                count: Some(5),
+            })
+            .unwrap()
+            .0;
+        assert!(
+            samples.values.iter().all(|value| *value == 2.0),
+            "{:?}",
+            samples.values
+        );
     }
 
     #[test]

@@ -45,3 +45,5 @@ interprocess = { version = "2.4.9", features = ["tokio"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 rumqttc = { version = "0.25", default-features = false }
+tokio-modbus = { version = "0.17", features = ["tcp", "rtu"] }
+tokio-serial = "5"
