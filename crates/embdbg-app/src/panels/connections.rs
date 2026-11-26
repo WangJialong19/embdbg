@@ -254,7 +254,8 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
     ui.add_space(SPACE_3);
     ui.separator();
     ui.add_space(SPACE_2);
-    ui.label(RichText::new("连接").strong());
+    ui.label(RichText::new("连接").strong())
+        .on_hover_text("点击连接名称切换；同一个接口换端口或地址可以再开一个");
     let active = engine.active_id();
     let connections = engine.connections();
     if connections.is_empty() {
@@ -270,7 +271,11 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
             } else {
                 FG_DIM
             });
-            if ui.selectable_label(selected, label).clicked() {
+            if ui
+                .selectable_label(selected, label)
+                .on_hover_text("切换到这个连接")
+                .clicked()
+            {
                 engine.set_active(connection.id);
             }
             let state = connection.state();
@@ -368,6 +373,44 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
     }
 
     action
+}
+
+/// The id of an open connection matching the form, so its button can act as a toggle.
+fn open_matching(engine: &Engine, matches: impl Fn(&TransportConfig) -> bool) -> Option<u64> {
+    engine
+        .connections()
+        .into_iter()
+        .find(|connection| {
+            matches!(
+                connection.state(),
+                ConnectionState::Connecting | ConnectionState::Open
+            ) && matches(&connection.config)
+        })
+        .map(|connection| connection.id)
+}
+
+/// A full-width primary button: accent while closed, red while open, labels included.
+fn primary_button(
+    ui: &mut Ui,
+    open: Option<u64>,
+    open_label: &str,
+    open_icon: &str,
+    close_label: &str,
+    enabled: bool,
+) -> bool {
+    let closing = open.is_some();
+    let button = Button::new(icon_label(
+        if closing { outline::X } else { open_icon },
+        if closing { close_label } else { open_label },
+        13.0,
+    ))
+    .min_size(vec2(ui.available_width(), 0.0))
+    .fill(if closing {
+        theme::DANGER.gamma_multiply(0.22)
+    } else {
+        theme::ACCENT.gamma_multiply(0.30)
+    });
+    ui.add_enabled(enabled, button).clicked()
 }
 
 /// Serial: the port, its line settings, and the button that opens it.
@@ -474,17 +517,31 @@ fn serial_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, actio
         });
 
     ui.add_space(SPACE_1);
-    let can_open = !state.port.is_empty();
-    let button = Button::new(icon_label(outline::PLUG_CONNECTED, "打开串口", 13.0))
-        .min_size(vec2(ui.available_width(), 0.0))
-        .fill(theme::ACCENT.gamma_multiply(0.30));
-    if ui
-        .add_enabled(can_open, button)
-        .on_disabled_hover_text("先选择端口")
-        .clicked()
-        && let Err(error) = engine.open(TransportConfig::Serial(state.serial_config()))
-    {
-        *action = Action::Failed(error);
+    let existing = open_matching(engine, |config| match config {
+        TransportConfig::Serial(serial) => serial.port == state.port,
+        _ => false,
+    });
+    let can_open = existing.is_some() || !state.port.is_empty();
+    if primary_button(
+        ui,
+        existing,
+        "打开串口",
+        outline::PLUG_CONNECTED,
+        "关闭串口",
+        can_open,
+    ) {
+        if let Some(id) = existing {
+            engine.close(id);
+        } else if let Err(error) = engine.open(TransportConfig::Serial(state.serial_config())) {
+            *action = Action::Failed(error);
+        }
+    }
+    if existing.is_some() {
+        ui.label(
+            RichText::new("已打开；改参数请先关闭，换一个端口可同时打开多个串口")
+                .small()
+                .color(FG_DIM),
+        );
     }
 }
 
@@ -509,22 +566,30 @@ fn tcp_client_form(
         });
 
     ui.add_space(SPACE_1);
-    let button = Button::new(icon_label(outline::WORLD_WWW, "连接", 13.0))
-        .min_size(vec2(ui.available_width(), 0.0))
-        .fill(theme::ACCENT.gamma_multiply(0.30));
-    if ui.add(button).clicked() {
-        match parse_port(&state.client_port) {
-            Ok(port) => {
-                let config = TcpClientConfig {
-                    host: state.host.clone(),
-                    port,
-                    connect_timeout_ms: 3000,
-                };
-                if let Err(error) = engine.open(TransportConfig::TcpClient(config)) {
-                    *action = Action::Failed(error);
+    let port = parse_port(&state.client_port).ok();
+    let existing = port.and_then(|port| {
+        open_matching(engine, |config| {
+            matches!(config, TransportConfig::TcpClient(client)
+                if client.host == state.host && client.port == port)
+        })
+    });
+    if primary_button(ui, existing, "连接", outline::WORLD_WWW, "断开", true) {
+        if let Some(id) = existing {
+            engine.close(id);
+        } else {
+            match parse_port(&state.client_port) {
+                Ok(port) => {
+                    let config = TcpClientConfig {
+                        host: state.host.clone(),
+                        port,
+                        connect_timeout_ms: 3000,
+                    };
+                    if let Err(error) = engine.open(TransportConfig::TcpClient(config)) {
+                        *action = Action::Failed(error);
+                    }
                 }
+                Err(error) => *action = Action::Failed(error),
             }
-            Err(error) => *action = Action::Failed(error),
         }
     }
 }
@@ -550,21 +615,29 @@ fn tcp_server_form(
         });
 
     ui.add_space(SPACE_1);
-    let button = Button::new(icon_label(outline::SERVER, "监听", 13.0))
-        .min_size(vec2(ui.available_width(), 0.0))
-        .fill(theme::ACCENT.gamma_multiply(0.30));
-    if ui.add(button).clicked() {
-        match parse_port(&state.server_port) {
-            Ok(port) => {
-                let config = TcpServerConfig {
-                    bind: state.bind.clone(),
-                    port,
-                };
-                if let Err(error) = engine.open(TransportConfig::TcpServer(config)) {
-                    *action = Action::Failed(error);
+    let port = parse_port(&state.server_port).ok();
+    let existing = port.and_then(|port| {
+        open_matching(engine, |config| {
+            matches!(config, TransportConfig::TcpServer(server)
+                if server.bind == state.bind && server.port == port)
+        })
+    });
+    if primary_button(ui, existing, "监听", outline::SERVER, "停止监听", true) {
+        if let Some(id) = existing {
+            engine.close(id);
+        } else {
+            match parse_port(&state.server_port) {
+                Ok(port) => {
+                    let config = TcpServerConfig {
+                        bind: state.bind.clone(),
+                        port,
+                    };
+                    if let Err(error) = engine.open(TransportConfig::TcpServer(config)) {
+                        *action = Action::Failed(error);
+                    }
                 }
+                Err(error) => *action = Action::Failed(error),
             }
-            Err(error) => *action = Action::Failed(error),
         }
     }
 }
@@ -593,23 +666,38 @@ fn udp_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: 
         });
 
     ui.add_space(SPACE_1);
-    let button = Button::new(icon_label(outline::BROADCAST, "打开 UDP", 13.0))
-        .min_size(vec2(ui.available_width(), 0.0))
-        .fill(theme::ACCENT.gamma_multiply(0.30));
-    if ui.add(button).clicked() {
-        match parse_port(&state.udp_port) {
-            Ok(port) => {
-                let config = UdpConfig {
-                    bind: "0.0.0.0".to_owned(),
-                    port,
-                    target: Some(state.udp_target.clone())
-                        .filter(|target| !target.trim().is_empty()),
-                };
-                if let Err(error) = engine.open(TransportConfig::Udp(config)) {
-                    *action = Action::Failed(error);
+    let port = parse_port(&state.udp_port).ok();
+    let existing = port.and_then(|port| {
+        open_matching(
+            engine,
+            |config| matches!(config, TransportConfig::Udp(udp) if udp.port == port),
+        )
+    });
+    if primary_button(
+        ui,
+        existing,
+        "打开 UDP",
+        outline::BROADCAST,
+        "关闭 UDP",
+        true,
+    ) {
+        if let Some(id) = existing {
+            engine.close(id);
+        } else {
+            match parse_port(&state.udp_port) {
+                Ok(port) => {
+                    let config = UdpConfig {
+                        bind: "0.0.0.0".to_owned(),
+                        port,
+                        target: Some(state.udp_target.clone())
+                            .filter(|target| !target.trim().is_empty()),
+                    };
+                    if let Err(error) = engine.open(TransportConfig::Udp(config)) {
+                        *action = Action::Failed(error);
+                    }
                 }
+                Err(error) => *action = Action::Failed(error),
             }
-            Err(error) => *action = Action::Failed(error),
         }
     }
 }
@@ -632,16 +720,19 @@ fn ws_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: &
         });
 
     ui.add_space(SPACE_1);
-    let button = Button::new(icon_label(outline::WORLD_WWW, "连接", 13.0))
-        .min_size(vec2(ui.available_width(), 0.0))
-        .fill(theme::ACCENT.gamma_multiply(0.30));
-    if ui.add(button).clicked() {
-        let url = state.ws_url.trim();
-        if url.is_empty() {
+    let url = state.ws_url.trim().to_owned();
+    let existing = open_matching(
+        engine,
+        |config| matches!(config, TransportConfig::WebSocket(ws) if ws.url == url),
+    );
+    if primary_button(ui, existing, "连接", outline::WORLD_WWW, "断开", true) {
+        if let Some(id) = existing {
+            engine.close(id);
+        } else if url.is_empty() {
             *action = Action::Failed("WebSocket 地址不能为空".to_owned());
-        } else if let Err(error) = engine.open(TransportConfig::WebSocket(WsConfig {
-            url: url.to_owned(),
-        })) {
+        } else if let Err(error) =
+            engine.open(TransportConfig::WebSocket(WsConfig { url: url.clone() }))
+        {
             *action = Action::Failed(error);
         }
     }
@@ -716,28 +807,39 @@ fn mqtt_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action:
         });
 
     ui.add_space(SPACE_1);
-    let button = Button::new(icon_label(outline::BROADCAST, "连接", 13.0))
-        .min_size(vec2(ui.available_width(), 0.0))
-        .fill(theme::ACCENT.gamma_multiply(0.30));
-    if ui.add(button).clicked() {
-        match parse_port(&state.mqtt_port) {
-            Ok(port) => {
-                let config = MqttConfig {
-                    host: state.host.clone(),
-                    port,
-                    client_id: String::new(),
-                    username: Some(state.mqtt_user.clone()).filter(|user| !user.trim().is_empty()),
-                    password: Some(state.mqtt_password.clone())
-                        .filter(|password| !password.is_empty()),
-                    subscribe: state.mqtt_subscribe.clone(),
-                    publish: state.mqtt_publish.clone(),
-                    qos: state.mqtt_qos.min(2),
-                };
-                if let Err(error) = engine.open(TransportConfig::Mqtt(config)) {
-                    *action = Action::Failed(error);
+    let port = parse_port(&state.mqtt_port).ok();
+    let existing = port.and_then(|port| {
+        open_matching(engine, |config| {
+            matches!(config, TransportConfig::Mqtt(mqtt)
+                if mqtt.host == state.host
+                    && mqtt.port == port
+                    && mqtt.subscribe == state.mqtt_subscribe)
+        })
+    });
+    if primary_button(ui, existing, "连接", outline::BROADCAST, "断开", true) {
+        if let Some(id) = existing {
+            engine.close(id);
+        } else {
+            match parse_port(&state.mqtt_port) {
+                Ok(port) => {
+                    let config = MqttConfig {
+                        host: state.host.clone(),
+                        port,
+                        client_id: String::new(),
+                        username: Some(state.mqtt_user.clone())
+                            .filter(|user| !user.trim().is_empty()),
+                        password: Some(state.mqtt_password.clone())
+                            .filter(|password| !password.is_empty()),
+                        subscribe: state.mqtt_subscribe.clone(),
+                        publish: state.mqtt_publish.clone(),
+                        qos: state.mqtt_qos.min(2),
+                    };
+                    if let Err(error) = engine.open(TransportConfig::Mqtt(config)) {
+                        *action = Action::Failed(error);
+                    }
                 }
+                Err(error) => *action = Action::Failed(error),
             }
-            Err(error) => *action = Action::Failed(error),
         }
     }
 }
@@ -831,10 +933,30 @@ fn modbus_form(
     );
 
     ui.add_space(SPACE_1);
-    let button = Button::new(icon_label(outline::PLUG_CONNECTED, "连接", 13.0))
-        .min_size(vec2(ui.available_width(), 0.0))
-        .fill(theme::ACCENT.gamma_multiply(0.30));
-    if !ui.add(button).clicked() {
+    let typed_port = if tcp {
+        parse_port(&state.modbus_port).ok()
+    } else {
+        None
+    };
+    let existing = open_matching(engine, |config| match config {
+        TransportConfig::Modbus(modbus) => match (&modbus.endpoint, tcp) {
+            (ModbusEndpoint::Tcp { host, port }, true) => {
+                Some(*port) == typed_port
+                    && host == &state.host
+                    && modbus.slave == state.modbus_slave
+            }
+            (ModbusEndpoint::Rtu { port, .. }, false) => {
+                port == &state.port && modbus.slave == state.modbus_slave
+            }
+            _ => false,
+        },
+        _ => false,
+    });
+    if !primary_button(ui, existing, "连接", outline::PLUG_CONNECTED, "断开", true) {
+        return;
+    }
+    if let Some(id) = existing {
+        engine.close(id);
         return;
     }
     let blocks: Result<Vec<_>, String> = state
