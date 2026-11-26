@@ -85,7 +85,9 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
         );
         return None;
     }
-    if !is_usable(&loaded.dock) {
+    let mut dock = loaded.dock;
+    expand(&mut dock);
+    if !is_usable(&dock) {
         tracing::warn!(
             target: "embdbg::layout",
             "布局缺少页签或页签重复（{}），使用默认布局",
@@ -93,7 +95,7 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
         );
         return None;
     }
-    Some(loaded.dock)
+    Some(dock)
 }
 
 /// The layout's text, so an unchanged layout is not written again.
@@ -103,6 +105,7 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
 /// what the user arranged, not on the window size.
 pub fn serialize(dock: &DockState<Tab>) -> anyhow::Result<String> {
     let mut dock = dock.clone();
+    expand(&mut dock);
     for surface in dock.iter_surfaces_mut() {
         for node in surface.iter_nodes_mut() {
             node.set_rect(egui::Rect::ZERO);
@@ -134,6 +137,22 @@ fn write_to(path: &Path, text: &str) -> anyhow::Result<()> {
 /// Whether the layout is one this build can use: every required tab exactly once, and at most
 /// one of each side panel. Anything else (a layout from another version, a hand-edited file)
 /// falls back to the default instead of starting with tabs missing.
+/// Undoes egui_dock's pane folding. A saved layout should never reopen as a blank strip, and a
+/// pane folded by an older version comes back with its contents.
+fn expand(dock: &mut DockState<Tab>) {
+    for surface in dock.iter_surfaces_mut() {
+        for node in surface.iter_nodes_mut() {
+            if matches!(node, egui_dock::Node::Empty) {
+                continue;
+            }
+            node.set_collapsed(false);
+            if node.is_parent() {
+                node.set_collapsed_leaf_count(0);
+            }
+        }
+    }
+}
+
 fn is_usable(dock: &DockState<Tab>) -> bool {
     let mut seen = HashSet::new();
     for surface in dock.iter_surfaces() {
@@ -203,6 +222,29 @@ mod tests {
             loaded.main_surface().find_tab(&Tab::Terminal).unwrap().1,
             egui_dock::TabIndex(0)
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folded_pane_comes_back_expanded() {
+        let mut dock = default_dock();
+        let (node, _) = dock
+            .main_surface()
+            .find_tab(&Tab::Connections)
+            .expect("the sidebar is in the default layout");
+        dock.main_surface_mut()[node].set_collapsed(true);
+        assert!(dock.main_surface()[node].is_collapsed());
+
+        // Saving never keeps the folded state, so a blank strip cannot be restored.
+        let text = serialize(&dock).unwrap();
+        let parsed: Loaded = serde_json::from_str(&text).unwrap();
+        assert!(!parsed.dock.main_surface()[node].is_collapsed());
+
+        let dir = temp_dir();
+        let path = dir.join("layout.json");
+        write_to(&path, &text).unwrap();
+        let loaded = load_from(&path).expect("a saved layout loads");
+        assert!(!loaded.main_surface()[node].is_collapsed());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

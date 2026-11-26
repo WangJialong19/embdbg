@@ -868,6 +868,9 @@ impl EmbDbgApp {
             .style(egui_dock::Style::from_egui(ui.style()))
             // The tab's own close button is enough; a second one for the whole pane is noise.
             .show_leaf_close_all_buttons(false)
+            // The arrow egui_dock puts at the left of a tab bar folds the pane into a blank strip.
+            // Hiding is what the toolbar toggle and the tab's close button do instead.
+            .show_leaf_collapse_buttons(false)
             // Dragging the junction resizes several panes at once, which is how the sidebar used
             // to shrink upwards as well. Individual separators are still draggable.
             .draggable_separator_junctions(false)
