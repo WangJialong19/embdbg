@@ -700,7 +700,7 @@ impl EmbDbgApp {
             dock,
             connections: ConnectionsState::from_form(form.clone()),
             channels: ChannelUi::default(),
-            terminal: TerminalState::default(),
+            terminal: TerminalState::with_names(saved.terminal_names.clone()),
             hex: HexState::default(),
             send: SendState::with_macros(macros),
             xy: XyState::default(),
@@ -997,11 +997,7 @@ impl egui_dock::TabViewer for DockViewer<'_> {
                 let shared = self.engine.active_shared();
                 panels::histogram::ui(ui, &shared, self.histogram);
             }
-            Tab::Terminal => {
-                let active = self.engine.active();
-                let shared = self.engine.active_shared();
-                panels::terminal::ui(ui, self.engine, active.as_deref(), &shared, self.terminal);
-            }
+            Tab::Terminal => panels::terminal::ui(ui, self.engine, self.terminal),
             Tab::Hex => {
                 let shared = self.engine.active_shared();
                 panels::hex::ui(ui, &shared, self.hex);
@@ -1216,6 +1212,9 @@ impl eframe::App for EmbDbgApp {
         if self.send.take_macros_changed() {
             self.save_macros();
         }
+        if self.terminal.take_names_changed() {
+            self.save_terminal_names();
+        }
 
         let ctx = ui.ctx().clone();
         self.handle_settings(&ctx);
@@ -1238,6 +1237,9 @@ impl eframe::App for EmbDbgApp {
         self.save_connection_form(true);
         if self.send.take_macros_changed() {
             self.save_macros();
+        }
+        if self.terminal.take_names_changed() {
+            self.save_terminal_names();
         }
     }
 }
@@ -1342,6 +1344,18 @@ impl EmbDbgApp {
         match next.save() {
             Ok(()) => self.saved = next,
             Err(error) => self.log.error(format!("保存发送宏失败：{error}")),
+        }
+    }
+
+    /// Writes the custom terminal-tab names.
+    fn save_terminal_names(&mut self) {
+        let names = self.terminal.names().clone();
+        let mut next = self.saved.clone();
+        next.terminal_names = names.clone();
+        self.pending.terminal_names = names;
+        match next.save() {
+            Ok(()) => self.saved = next,
+            Err(error) => self.log.error(format!("保存终端名称失败：{error}")),
         }
     }
 

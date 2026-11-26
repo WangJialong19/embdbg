@@ -4,17 +4,20 @@
 //! that redraw a line, full-screen programs, and keys that go straight down the port — closer to
 //! Electerm than to a list of lines.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{
     Align, Color32, CursorIcon, Event, EventFilter, FontId, ImeEvent, Key, Layout, Modifiers,
-    PointerButton, Pos2, Rangef, Rect, RichText, Sense, Stroke, Ui, Vec2, epaint::CornerRadius,
-    output::IMEOutput,
+    PointerButton, Pos2, Rangef, Rect, RichText, Sense, Stroke, TextEdit, Ui, Vec2,
+    epaint::CornerRadius, output::IMEOutput,
 };
-use embdbg_core::engine::{Connection, Engine};
+use embdbg_core::engine::{Connection, ConnectionId, ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::SessionShared;
 use embdbg_core::pipeline::Terminal;
 use embdbg_core::pipeline::terminal::vt100;
+use embdbg_core::transport::ModbusEndpoint;
 
 use crate::theme;
 
@@ -62,21 +65,182 @@ pub struct TerminalState {
     /// How many lines the scrollback held when the selection began. The view scrolls back in
     /// step with that number, so new output does not slide the cells out from under the mouse.
     selection_scrollback: usize,
+    /// The connection whose terminal is on screen. It is deliberately independent of the
+    /// engine's active connection, so watching a console does not follow the other views.
+    selected: Option<ConnectionId>,
+    /// Connections seen last frame, to notice a newly opened one.
+    known: Vec<ConnectionId>,
+    /// The connection last drawn, so switching tabs resets the grid and input state.
+    shown: Option<ConnectionId>,
+    /// Custom tab names, keyed by [`connection_key`].
+    names: BTreeMap<String, String>,
+    /// Set when a name was changed, so the app writes the settings.
+    names_changed: bool,
+    /// The connection being renamed, if the tab is in its editor.
+    editing: Option<ConnectionId>,
+    rename_draft: String,
 }
 
-/// Draws the terminal of `connection` and sends whatever is typed into it.
-pub fn ui(
+impl TerminalState {
+    /// Restores the custom names saved last time.
+    pub fn with_names(names: BTreeMap<String, String>) -> Self {
+        Self {
+            names,
+            ..Self::default()
+        }
+    }
+
+    pub fn names(&self) -> &BTreeMap<String, String> {
+        &self.names
+    }
+
+    /// Whether a tab was renamed since the last save; the flag is cleared.
+    pub fn take_names_changed(&mut self) -> bool {
+        std::mem::take(&mut self.names_changed)
+    }
+}
+
+/// The tab label when the user has not renamed the connection.
+pub fn default_name(config: &TransportConfig) -> String {
+    match config {
+        TransportConfig::Simulator(_) => "模拟源".to_owned(),
+        TransportConfig::Serial(serial) => serial.port.clone(),
+        TransportConfig::TcpClient(client) => format!("{}:{}", client.host, client.port),
+        TransportConfig::TcpServer(server) => format!("监听 {}:{}", server.bind, server.port),
+        TransportConfig::Udp(udp) => format!("UDP {}", udp.port),
+        TransportConfig::WebSocket(ws) => ws.url.clone(),
+        TransportConfig::Mqtt(mqtt) => format!("MQTT {}:{}", mqtt.host, mqtt.port),
+        TransportConfig::Modbus(modbus) => match &modbus.endpoint {
+            ModbusEndpoint::Tcp { host, port } => format!("Modbus {host}:{port}"),
+            ModbusEndpoint::Rtu { port, .. } => format!("Modbus {port}"),
+        },
+    }
+}
+
+/// The key a custom tab name is stored under. It stays the same when the port's baud rate or a
+/// protocol setting changes, so renaming COM5 survives a reopen.
+fn connection_key(config: &TransportConfig) -> String {
+    format!("{}|{}", config.kind(), default_name(config))
+}
+
+fn state_color(state: &ConnectionState) -> Color32 {
+    match state {
+        ConnectionState::Connecting => theme::WARNING,
+        ConnectionState::Open => theme::SUCCESS,
+        ConnectionState::Closed => theme::FG_DIM,
+        ConnectionState::Failed(_) => theme::DANGER,
+    }
+}
+
+/// Draws one tab per connection and the terminal of the selected one.
+pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut TerminalState) {
+    let connections = engine.connections();
+    if connections.is_empty() {
+        ui.label(
+            RichText::new("先打开一个连接，每个连接都会有自己的一页终端。").color(theme::FG_DIM),
+        );
+        return;
+    }
+
+    // A newly opened connection comes to the front; a connection that disappeared falls back to
+    // the engine's active one, then to the first.
+    let ids: Vec<ConnectionId> = connections.iter().map(|connection| connection.id).collect();
+    if let Some(new) = ids.iter().find(|id| !state.known.contains(id)).copied() {
+        state.selected = Some(new);
+    }
+    state.known = ids.clone();
+    if !state.selected.is_some_and(|id| ids.contains(&id)) {
+        state.selected = engine
+            .active_id()
+            .filter(|id| ids.contains(id))
+            .or_else(|| ids.first().copied());
+    }
+    terminal_tabs(ui, &connections, state);
+
+    let Some(connection) = state
+        .selected
+        .and_then(|id| connections.iter().find(|connection| connection.id == id))
+        .cloned()
+    else {
+        return;
+    };
+    if state.shown != Some(connection.id) {
+        state.shown = Some(connection.id);
+        state.size = (0, 0);
+        state.selection = None;
+        state.preedit.clear();
+    }
+    body(ui, engine, &connection, &connection.shared, state);
+}
+
+/// The row of connection tabs. Click switches the terminal, double-click renames the tab.
+fn terminal_tabs(ui: &mut Ui, connections: &[Arc<Connection>], state: &mut TerminalState) {
+    let mut start_edit: Option<(ConnectionId, String)> = None;
+    let mut commit: Option<(ConnectionId, String)> = None;
+
+    ui.horizontal_wrapped(|ui| {
+        for connection in connections {
+            let key = connection_key(&connection.config);
+            let name = state
+                .names
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| default_name(&connection.config));
+
+            if state.editing == Some(connection.id) {
+                let editor = ui.add_sized(
+                    [120.0, 20.0],
+                    TextEdit::singleline(&mut state.rename_draft).hint_text("名称"),
+                );
+                editor.request_focus();
+                let enter = ui.input(|input| input.key_pressed(Key::Enter));
+                if enter || editor.lost_focus() {
+                    commit = Some((connection.id, state.rename_draft.clone()));
+                }
+                continue;
+            }
+
+            let selected = state.selected == Some(connection.id);
+            let color = state_color(&connection.state());
+            let response = ui
+                .selectable_label(selected, RichText::new(format!("● {name}")).color(color))
+                .on_hover_text("单击切换终端，双击重命名");
+            if response.double_clicked() {
+                start_edit = Some((connection.id, name));
+            } else if response.clicked() {
+                state.selected = Some(connection.id);
+            }
+        }
+    });
+
+    if let Some((id, draft)) = start_edit {
+        state.editing = Some(id);
+        state.rename_draft = draft;
+    }
+    if let Some((id, draft)) = commit {
+        if let Some(connection) = connections.iter().find(|connection| connection.id == id) {
+            let key = connection_key(&connection.config);
+            let name = draft.trim();
+            if name.is_empty() {
+                state.names.remove(&key);
+            } else {
+                state.names.insert(key, name.to_owned());
+            }
+            state.names_changed = true;
+        }
+        state.editing = None;
+        state.rename_draft.clear();
+    }
+}
+
+/// Draws the terminal of one connection and sends whatever is typed into it.
+fn body(
     ui: &mut Ui,
     engine: &Engine,
-    connection: Option<&Connection>,
+    connection: &Connection,
     shared: &SessionShared,
     state: &mut TerminalState,
 ) {
-    let Some(connection) = connection else {
-        ui.label(RichText::new("先打开一个连接，终端会显示它的输出。").color(theme::FG_DIM));
-        return;
-    };
-
     // One monospace cell, measured from a frame's own font.
     let font = FontId::monospace(FONT_SIZE);
     let (cell_width, line_height) = {
@@ -780,6 +944,23 @@ mod tests {
             event_bytes(&Event::Paste("ls\r".to_owned())),
             Some(b"ls\r".to_vec())
         );
+    }
+
+    #[test]
+    fn tabs_are_named_after_their_connection() {
+        let serial = TransportConfig::Serial(embdbg_core::transport::SerialConfig {
+            port: "COM5".to_owned(),
+            baud: 921_600,
+            ..embdbg_core::transport::SerialConfig::default()
+        });
+        assert_eq!(default_name(&serial), "COM5");
+        assert_eq!(connection_key(&serial), "串口|COM5");
+        // The key does not depend on the baud rate, so a rename survives a reopen.
+        let slower = TransportConfig::Serial(embdbg_core::transport::SerialConfig {
+            port: "COM5".to_owned(),
+            ..embdbg_core::transport::SerialConfig::default()
+        });
+        assert_eq!(connection_key(&slower), connection_key(&serial));
     }
 
     #[test]

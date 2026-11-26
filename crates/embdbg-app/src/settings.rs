@@ -1,5 +1,6 @@
 //! The settings a person can change, and where they are kept.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -169,6 +170,8 @@ pub struct Settings {
     pub connections: ConnectionForm,
     /// Saved messages of the send panel.
     pub macros: Vec<SendMacro>,
+    /// Custom terminal-tab names, keyed by `kind|default name`.
+    pub terminal_names: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -178,6 +181,7 @@ impl Default for Settings {
             max_fps: 0.0,
             connections: ConnectionForm::default(),
             macros: Vec::new(),
+            terminal_names: BTreeMap::new(),
         }
     }
 }
@@ -276,6 +280,7 @@ mod tests {
                 text: "AT+VER?".to_owned(),
                 ..SendMacro::default()
             }],
+            terminal_names: BTreeMap::from([("串口|COM5".to_owned(), "主板".to_owned())]),
         };
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), settings);
