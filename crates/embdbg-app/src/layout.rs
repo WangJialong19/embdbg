@@ -17,9 +17,8 @@ use crate::logging;
 /// Bumped when the meaning of a saved layout changes; older files then fall back to the default.
 const VERSION: u32 = 2;
 
-/// Every tab except the channel table: the table can be closed, the rest cannot.
-const REQUIRED: [Tab; 10] = [
-    Tab::Connections,
+/// Every tab except the two closable side panels: those may be missing from a saved layout.
+const REQUIRED: [Tab; 9] = [
     Tab::Waveform,
     Tab::Xy,
     Tab::Spectrum,
@@ -133,8 +132,8 @@ fn write_to(path: &Path, text: &str) -> anyhow::Result<()> {
 }
 
 /// Whether the layout is one this build can use: every required tab exactly once, and at most
-/// one channel table. Anything else (a layout from another version, a hand-edited file) falls
-/// back to the default instead of starting with tabs missing.
+/// one of each side panel. Anything else (a layout from another version, a hand-edited file)
+/// falls back to the default instead of starting with tabs missing.
 fn is_usable(dock: &DockState<Tab>) -> bool {
     let mut seen = HashSet::new();
     for surface in dock.iter_surfaces() {
@@ -204,6 +203,21 @@ mod tests {
             loaded.main_surface().find_tab(&Tab::Terminal).unwrap().1,
             egui_dock::TabIndex(0)
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_layout_with_both_side_panels_closed_round_trips() {
+        let mut dock = default_dock();
+        crate::app::set_channels_panel(&mut dock, false);
+        crate::app::set_connections_panel(&mut dock, false);
+        let text = serialize(&dock).unwrap();
+        let dir = temp_dir();
+        let path = dir.join("layout.json");
+        write_to(&path, &text).unwrap();
+        let loaded = load_from(&path).expect("a layout without the side panels loads");
+        assert!(!crate::app::channels_panel_open(&loaded));
+        assert!(!crate::app::connections_panel_open(&loaded));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

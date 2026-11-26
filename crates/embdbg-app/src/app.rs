@@ -38,6 +38,12 @@ const STATUSBAR_HEIGHT: f32 = 24.0;
 /// takes the remainder. `split_right` gives the fraction to the old, left-hand side.
 const INSPECTOR_SPLIT: f32 = 0.56;
 
+/// Share of the window width the left sidebar starts with.
+const SIDEBAR_SPLIT: f32 = 0.18;
+/// The sidebar may be dragged between these widths, in points. Smaller is hidden, not narrow.
+const SIDEBAR_MIN: f32 = 200.0;
+const SIDEBAR_MAX: f32 = 400.0;
+
 /// How often the window repaints when nothing streams, just to notice state changes.
 const IDLE_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -160,11 +166,57 @@ pub(crate) fn default_dock() -> egui_dock::DockState<Tab> {
     let tree = dock.main_surface_mut();
     // `split_*` returns `[old, new]`, and the fraction is the share of whichever child comes
     // first in layout order: the new node for a split to the left, the old one otherwise.
-    let [center, _sidebar] = tree.split_left(NodeIndex::root(), 0.18, vec![Tab::Connections]);
+    let [center, _sidebar] =
+        tree.split_left(NodeIndex::root(), SIDEBAR_SPLIT, vec![Tab::Connections]);
     // The channel table needs about 430 points at the default window size.
     let [center, _inspector] = tree.split_right(center, INSPECTOR_SPLIT, vec![Tab::Inspector]);
     let [_center, _bottom] = tree.split_below(center, 0.68, vec![Tab::Send, Tab::Log]);
     dock
+}
+
+/// Whether the connection sidebar is part of the layout.
+pub(crate) fn connections_panel_open(dock: &egui_dock::DockState<Tab>) -> bool {
+    dock.find_tab(&Tab::Connections).is_some()
+}
+
+/// Closes or reopens the connection sidebar against the left edge.
+pub(crate) fn set_connections_panel(dock: &mut egui_dock::DockState<Tab>, open: bool) {
+    if open == connections_panel_open(dock) {
+        return;
+    }
+    if open {
+        if dock.main_surface().root_node().is_none() {
+            dock.push_to_focused_leaf(Tab::Connections);
+        } else {
+            dock.main_surface_mut().split_left(
+                egui_dock::NodeIndex::root(),
+                SIDEBAR_SPLIT,
+                vec![Tab::Connections],
+            );
+        }
+    } else if let Some(path) = dock.find_tab(&Tab::Connections) {
+        dock.remove_tab(path);
+    }
+}
+
+/// Keeps the connection sidebar a sensible size: wide enough for the forms, never more than the
+/// fixed limit or 40% of the window. Without this the divider can swallow the whole window.
+fn clamp_connections_width(dock: &mut egui_dock::DockState<Tab>, width: f32) {
+    if width <= 0.0 {
+        return;
+    }
+    let Some((node, _)) = dock.main_surface().find_tab(&Tab::Connections) else {
+        return;
+    };
+    let root = egui_dock::NodeIndex::root();
+    if node != root.left() {
+        return;
+    }
+    let min = (SIDEBAR_MIN / width).clamp(0.05, 0.9);
+    let max = (SIDEBAR_MAX / width).clamp(min, 0.4);
+    if let egui_dock::Node::Horizontal(split) = &mut dock.main_surface_mut()[root] {
+        split.fraction = split.fraction.clamp(min, max);
+    }
 }
 
 /// Whether the channel table is part of the layout.
@@ -687,6 +739,20 @@ impl EmbDbgApp {
                     self.settings_open = !self.settings_open;
                 }
                 ui.separator();
+                let connections_open = connections_panel_open(&self.dock);
+                let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR, "连接", 13.5))
+                    .selected(connections_open);
+                if ui
+                    .add(toggle)
+                    .on_hover_text(if connections_open {
+                        "隐藏左侧的连接栏"
+                    } else {
+                        "显示左侧的连接栏"
+                    })
+                    .clicked()
+                {
+                    set_connections_panel(&mut self.dock, !connections_open);
+                }
                 let open = channels_panel_open(&self.dock);
                 let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR_RIGHT, "通道", 13.5))
                     .selected(open);
@@ -797,11 +863,16 @@ impl EmbDbgApp {
             histogram,
             ai,
         };
+        let width = ui.available_width();
         egui_dock::DockArea::new(dock)
             .style(egui_dock::Style::from_egui(ui.style()))
             // The tab's own close button is enough; a second one for the whole pane is noise.
             .show_leaf_close_all_buttons(false)
+            // Dragging the junction resizes several panes at once, which is how the sidebar used
+            // to shrink upwards as well. Individual separators are still draggable.
+            .draggable_separator_junctions(false)
             .show_inside(ui, &mut viewer);
+        clamp_connections_width(dock, width);
     }
 
     fn schedule_repaint(&self, ctx: &egui::Context) {
@@ -938,10 +1009,10 @@ impl egui_dock::TabViewer for DockViewer<'_> {
         }
     }
 
-    /// Only the channel table can be closed, from its tab or from the toolbar; the data views
-    /// stay. `set_channels_panel` reopens it.
+    /// The two side panels can be closed, from their tabs or from the toolbar; the data views
+    /// stay. `set_connections_panel` and `set_channels_panel` reopen them.
     fn is_closeable(&self, tab: &Tab) -> bool {
-        matches!(tab, Tab::Inspector)
+        matches!(tab, Tab::Connections | Tab::Inspector)
     }
 }
 
@@ -1345,6 +1416,50 @@ mod tests {
             .map(<[Tab]>::to_vec)
             .unwrap_or_default();
         assert_eq!(right, [Tab::Inspector]);
+    }
+
+    #[test]
+    fn the_connections_panel_closes_and_reopens_on_the_left() {
+        let mut dock = default_dock();
+        assert!(connections_panel_open(&dock));
+
+        set_connections_panel(&mut dock, false);
+        assert!(!connections_panel_open(&dock));
+        assert_eq!(dock.main_surface().tabs().count(), 10);
+
+        set_connections_panel(&mut dock, true);
+        assert!(connections_panel_open(&dock));
+        let tree = dock.main_surface();
+        let root = egui_dock::NodeIndex::root();
+        assert!(tree[root].is_horizontal());
+        let left: Vec<Tab> = tree[root.left()]
+            .tabs()
+            .map(<[Tab]>::to_vec)
+            .unwrap_or_default();
+        assert_eq!(left, [Tab::Connections]);
+    }
+
+    #[test]
+    fn the_connections_sidebar_keeps_a_sane_width() {
+        let mut dock = default_dock();
+        let root = egui_dock::NodeIndex::root();
+        let set = |dock: &mut egui_dock::DockState<Tab>, fraction: f32| {
+            if let egui_dock::Node::Horizontal(split) = &mut dock.main_surface_mut()[root] {
+                split.fraction = fraction;
+            }
+        };
+        let get = |dock: &egui_dock::DockState<Tab>| match &dock.main_surface()[root] {
+            egui_dock::Node::Horizontal(split) => split.fraction,
+            _ => panic!("the root should be the sidebar split"),
+        };
+
+        set(&mut dock, 0.95);
+        clamp_connections_width(&mut dock, 1000.0);
+        assert!(get(&dock) <= 0.4 + 1e-4, "fraction {}", get(&dock));
+
+        set(&mut dock, 0.01);
+        clamp_connections_width(&mut dock, 1000.0);
+        assert!(get(&dock) >= 0.2 - 1e-4, "fraction {}", get(&dock));
     }
 
     #[test]
