@@ -4,7 +4,7 @@
 //! transport below it, and the list of open connections underneath. Only the chosen interface
 //! takes space, so the panel stays readable as more transports are added.
 
-use egui::{Button, ComboBox, DragValue, Grid, RichText, Ui, vec2};
+use egui::{Button, ComboBox, DragValue, Frame, Grid, Margin, RichText, Stroke, Ui, vec2};
 use embdbg_core::engine::{ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::DecoderSpec;
 use embdbg_core::transport::{
@@ -89,6 +89,8 @@ pub struct ConnectionsState {
     pub modbus_interval: u64,
     pub modbus_port: String,
     pub modbus_blocks: String,
+    /// Why the last open failed, shown in the panel instead of only in the log.
+    last_error: Option<(Interface, String)>,
 }
 
 impl Default for ConnectionsState {
@@ -147,6 +149,7 @@ impl ConnectionsState {
             modbus_interval: form.modbus_interval,
             modbus_port: form.modbus_port,
             modbus_blocks: form.modbus_blocks,
+            last_error: None,
         }
     }
 
@@ -214,6 +217,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
 
     ui.add_space(SPACE_2);
     ui.label(RichText::new("数据接口").small().color(FG_DIM));
+    let previous_interface = state.interface;
     ComboBox::from_id_salt("interface")
         .width(ui.available_width())
         .selected_text(interface_label(state.interface))
@@ -232,6 +236,9 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
                 ui.selectable_value(&mut state.interface, interface, interface_label(interface));
             }
         });
+    if state.interface != previous_interface {
+        state.last_error = None;
+    }
     ui.label(
         RichText::new(interface_hint(state.interface))
             .small()
@@ -249,6 +256,25 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
         Interface::ModbusTcp => modbus_form(ui, engine, state, &mut action, true),
         Interface::ModbusRtu => modbus_form(ui, engine, state, &mut action, false),
         Interface::Simulator => simulator_form(ui, engine, state),
+    }
+
+    // A failed open is easy to miss when it only goes to the log tab, so the panel says why
+    // right under the button that failed.
+    if let Action::Failed(message) = &action {
+        state.last_error = Some((state.interface, message.clone()));
+    }
+    if let Some((interface, message)) = &state.last_error
+        && *interface == state.interface
+    {
+        ui.add_space(SPACE_1);
+        Frame::new()
+            .fill(DANGER.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0, DANGER.gamma_multiply(0.55)))
+            .corner_radius(theme::RADIUS)
+            .inner_margin(Margin::same(8))
+            .show(ui, |ui| {
+                ui.label(RichText::new(message).small().color(DANGER));
+            });
     }
 
     ui.add_space(SPACE_3);
@@ -421,32 +447,36 @@ fn serial_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, actio
         .show(ui, |ui| {
             ui.label("端口");
             ui.horizontal(|ui| {
-                ComboBox::from_id_salt("serial-port")
-                    .width((ui.available_width() - 30.0).max(80.0))
-                    .selected_text(if state.port.is_empty() {
-                        "选择端口".to_owned()
-                    } else {
-                        state.port.clone()
-                    })
-                    .show_ui(ui, |ui| {
-                        for port in &state.ports {
-                            ui.selectable_value(&mut state.port, port.name.clone(), &port.name)
-                                .on_hover_text(&port.details);
+                // The refresh button goes first so it never gets clipped on a narrow panel; the
+                // port selector takes whatever width is left.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(Button::new(icon(outline::REFRESH, 14.0)))
+                        .on_hover_text("重新扫描串口")
+                        .clicked()
+                    {
+                        state.ports = list_ports();
+                        if !state.ports.iter().any(|port| port.name == state.port) {
+                            state.port = state
+                                .ports
+                                .first()
+                                .map_or_else(String::new, |port| port.name.clone());
                         }
-                    });
-                if ui
-                    .add(Button::new(icon(outline::REFRESH, 14.0)))
-                    .on_hover_text("重新扫描串口")
-                    .clicked()
-                {
-                    state.ports = list_ports();
-                    if !state.ports.iter().any(|port| port.name == state.port) {
-                        state.port = state
-                            .ports
-                            .first()
-                            .map_or_else(String::new, |port| port.name.clone());
                     }
-                }
+                    ComboBox::from_id_salt("serial-port")
+                        .width(ui.available_width())
+                        .selected_text(if state.port.is_empty() {
+                            "选择端口".to_owned()
+                        } else {
+                            state.port.clone()
+                        })
+                        .show_ui(ui, |ui| {
+                            for port in &state.ports {
+                                ui.selectable_value(&mut state.port, port.name.clone(), &port.name)
+                                    .on_hover_text(&port.details);
+                            }
+                        });
+                });
             });
             ui.end_row();
 
@@ -530,6 +560,7 @@ fn serial_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, actio
         "关闭串口",
         can_open,
     ) {
+        state.last_error = None;
         if let Some(id) = existing {
             engine.close(id);
         } else if let Err(error) = engine.open(TransportConfig::Serial(state.serial_config())) {
@@ -574,6 +605,7 @@ fn tcp_client_form(
         })
     });
     if primary_button(ui, existing, "连接", outline::WORLD_WWW, "断开", true) {
+        state.last_error = None;
         if let Some(id) = existing {
             engine.close(id);
         } else {
@@ -623,6 +655,7 @@ fn tcp_server_form(
         })
     });
     if primary_button(ui, existing, "监听", outline::SERVER, "停止监听", true) {
+        state.last_error = None;
         if let Some(id) = existing {
             engine.close(id);
         } else {
@@ -681,6 +714,7 @@ fn udp_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: 
         "关闭 UDP",
         true,
     ) {
+        state.last_error = None;
         if let Some(id) = existing {
             engine.close(id);
         } else {
@@ -726,6 +760,7 @@ fn ws_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: &
         |config| matches!(config, TransportConfig::WebSocket(ws) if ws.url == url),
     );
     if primary_button(ui, existing, "连接", outline::WORLD_WWW, "断开", true) {
+        state.last_error = None;
         if let Some(id) = existing {
             engine.close(id);
         } else if url.is_empty() {
@@ -817,6 +852,7 @@ fn mqtt_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action:
         })
     });
     if primary_button(ui, existing, "连接", outline::BROADCAST, "断开", true) {
+        state.last_error = None;
         if let Some(id) = existing {
             engine.close(id);
         } else {
@@ -955,6 +991,7 @@ fn modbus_form(
     if !primary_button(ui, existing, "连接", outline::PLUG_CONNECTED, "断开", true) {
         return;
     }
+    state.last_error = None;
     if let Some(id) = existing {
         engine.close(id);
         return;

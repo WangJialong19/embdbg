@@ -39,11 +39,11 @@ const STATUSBAR_HEIGHT: f32 = 24.0;
 /// takes the remainder. `split_right` gives the fraction to the old, left-hand side.
 const INSPECTOR_SPLIT: f32 = 0.56;
 
-/// Share of the window width the left sidebar starts with.
-const SIDEBAR_SPLIT: f32 = 0.18;
-/// The sidebar may be dragged between these widths, in points. Smaller is hidden, not narrow.
-const SIDEBAR_MIN: f32 = 200.0;
-const SIDEBAR_MAX: f32 = 400.0;
+/// The connection sidebar takes this share of the window width, within these bounds, in points.
+/// It is not draggable: the forms need a predictable width and the middle must keep the rest.
+const CONNECTIONS_WIDTH_SHARE: f32 = 0.20;
+const CONNECTIONS_MIN_WIDTH: f32 = 240.0;
+const CONNECTIONS_MAX_WIDTH: f32 = 340.0;
 
 /// How often the window repaints when nothing streams, just to notice state changes.
 const IDLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -90,7 +90,6 @@ pub struct WindowSettings {
 /// layout, which is the intended way to retire a tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Tab {
-    Connections,
     Waveform,
     Xy,
     Spectrum,
@@ -108,7 +107,6 @@ impl Tab {
     /// The name the command line uses.
     fn from_name(name: &str) -> Option<Self> {
         Some(match name.to_ascii_lowercase().as_str() {
-            "connections" => Self::Connections,
             "waveform" | "wave" => Self::Waveform,
             "xy" => Self::Xy,
             "spectrum" | "fft" => Self::Spectrum,
@@ -126,7 +124,6 @@ impl Tab {
 
     fn title(self) -> &'static str {
         match self {
-            Tab::Connections => "连接",
             Tab::Waveform => "波形",
             Tab::Xy => "X-Y",
             Tab::Spectrum => "频谱",
@@ -143,15 +140,18 @@ impl Tab {
 }
 
 /// The layout the window starts with: the one saved last time, with `initial_tab` selected if it
-/// names one; the default when there is nothing usable to restore.
-fn startup_dock(initial_tab: Option<&str>) -> egui_dock::DockState<Tab> {
-    let mut dock = crate::layout::load().unwrap_or_else(default_dock);
-    if let Some(tab) = initial_tab.and_then(Tab::from_name)
-        && let Some(path) = dock.find_tab(&tab)
+/// names one; the default when there is nothing usable to restore. `connections` opens the
+/// sidebar rather than a dock tab.
+fn startup_layout(initial_tab: Option<&str>) -> crate::layout::Layout {
+    let mut layout = crate::layout::load().unwrap_or_default();
+    if initial_tab == Some("connections") {
+        layout.connections_open = true;
+    } else if let Some(tab) = initial_tab.and_then(Tab::from_name)
+        && let Some(path) = layout.dock.find_tab(&tab)
     {
-        let _ = dock.set_active_tab(path);
+        let _ = layout.dock.set_active_tab(path);
     }
-    dock
+    layout
 }
 
 /// The layout a fresh window starts with.
@@ -171,57 +171,19 @@ pub(crate) fn default_dock() -> egui_dock::DockState<Tab> {
     let tree = dock.main_surface_mut();
     // `split_*` returns `[old, new]`, and the fraction is the share of whichever child comes
     // first in layout order: the new node for a split to the left, the old one otherwise.
-    let [center, _sidebar] =
-        tree.split_left(NodeIndex::root(), SIDEBAR_SPLIT, vec![Tab::Connections]);
     // The channel table needs about 430 points at the default window size.
-    let [center, _inspector] = tree.split_right(center, INSPECTOR_SPLIT, vec![Tab::Inspector]);
+    let [center, _inspector] =
+        tree.split_right(NodeIndex::root(), INSPECTOR_SPLIT, vec![Tab::Inspector]);
     let [_center, _bottom] = tree.split_below(center, 0.68, vec![Tab::Send, Tab::Log]);
     dock
 }
 
-/// Whether the connection sidebar is part of the layout.
-pub(crate) fn connections_panel_open(dock: &egui_dock::DockState<Tab>) -> bool {
-    dock.find_tab(&Tab::Connections).is_some()
-}
-
-/// Closes or reopens the connection sidebar against the left edge.
-pub(crate) fn set_connections_panel(dock: &mut egui_dock::DockState<Tab>, open: bool) {
-    if open == connections_panel_open(dock) {
-        return;
-    }
-    if open {
-        if dock.main_surface().root_node().is_none() {
-            dock.push_to_focused_leaf(Tab::Connections);
-        } else {
-            dock.main_surface_mut().split_left(
-                egui_dock::NodeIndex::root(),
-                SIDEBAR_SPLIT,
-                vec![Tab::Connections],
-            );
-        }
-    } else if let Some(path) = dock.find_tab(&Tab::Connections) {
-        dock.remove_tab(path);
-    }
-}
-
-/// Keeps the connection sidebar a sensible size: wide enough for the forms, never more than the
-/// fixed limit or 40% of the window. Without this the divider can swallow the whole window.
-fn clamp_connections_width(dock: &mut egui_dock::DockState<Tab>, width: f32) {
-    if width <= 0.0 {
-        return;
-    }
-    let Some((node, _)) = dock.main_surface().find_tab(&Tab::Connections) else {
-        return;
-    };
-    let root = egui_dock::NodeIndex::root();
-    if node != root.left() {
-        return;
-    }
-    let min = (SIDEBAR_MIN / width).clamp(0.05, 0.9);
-    let max = (SIDEBAR_MAX / width).clamp(min, 0.4);
-    if let egui_dock::Node::Horizontal(split) = &mut dock.main_surface_mut()[root] {
-        split.fraction = split.fraction.clamp(min, max);
-    }
+/// The width of the connection sidebar for a window this wide. The panel is not draggable, so
+/// the forms keep a usable width and a narrow window still leaves the middle its room.
+fn connections_width(available: f32) -> f32 {
+    (available * CONNECTIONS_WIDTH_SHARE)
+        .clamp(CONNECTIONS_MIN_WIDTH, CONNECTIONS_MAX_WIDTH)
+        .min(available * 0.4)
 }
 
 /// Whether the channel table is part of the layout.
@@ -583,6 +545,8 @@ pub struct EmbDbgApp {
     backend: String,
     settings: WindowSettings,
     dock: egui_dock::DockState<Tab>,
+    /// Whether the connection sidebar is shown; it is a plain panel, not a dock tab.
+    connections_open: bool,
     connections: ConnectionsState,
     channels: ChannelUi,
     log: LogBuffer,
@@ -680,8 +644,9 @@ impl EmbDbgApp {
             requested: false,
         });
 
-        let dock = startup_dock(initial_tab.as_deref());
-        let saved_layout = crate::layout::serialize(&dock).unwrap_or_default();
+        let layout = startup_layout(initial_tab.as_deref());
+        let saved_layout =
+            crate::layout::serialize(&layout.dock, layout.connections_open).unwrap_or_default();
         let persist_layout = settings.persist_layout;
         let form = saved.connections.clone();
         let (shot_tx, shot_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -697,7 +662,8 @@ impl EmbDbgApp {
             engine,
             backend,
             settings,
-            dock,
+            dock: layout.dock,
+            connections_open: layout.connections_open,
             connections: ConnectionsState::from_form(form.clone()),
             channels: ChannelUi::default(),
             terminal: TerminalState::with_names(saved.terminal_names.clone()),
@@ -746,7 +712,7 @@ impl EmbDbgApp {
                     self.settings_open = !self.settings_open;
                 }
                 ui.separator();
-                let connections_open = connections_panel_open(&self.dock);
+                let connections_open = self.connections_open;
                 let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR, "连接", 13.5))
                     .selected(connections_open);
                 if ui
@@ -758,7 +724,7 @@ impl EmbDbgApp {
                     })
                     .clicked()
                 {
-                    set_connections_panel(&mut self.dock, !connections_open);
+                    self.connections_open = !connections_open;
                 }
                 let open = channels_panel_open(&self.dock);
                 let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR_RIGHT, "通道", 13.5))
@@ -841,7 +807,6 @@ impl EmbDbgApp {
         let Self {
             dock,
             engine,
-            connections,
             channels,
             log,
             wave,
@@ -858,7 +823,6 @@ impl EmbDbgApp {
         } = self;
         let mut viewer = DockViewer {
             engine,
-            connections,
             channels,
             log,
             wave,
@@ -872,7 +836,6 @@ impl EmbDbgApp {
             ai,
             net,
         };
-        let width = ui.available_width();
         egui_dock::DockArea::new(dock)
             .style(egui_dock::Style::from_egui(ui.style()))
             // The tab's own close button is enough; a second one for the whole pane is noise.
@@ -880,11 +843,10 @@ impl EmbDbgApp {
             // The arrow egui_dock puts at the left of a tab bar folds the pane into a blank strip.
             // Hiding is what the toolbar toggle and the tab's close button do instead.
             .show_leaf_collapse_buttons(false)
-            // Dragging the junction resizes several panes at once, which is how the sidebar used
-            // to shrink upwards as well. Individual separators are still draggable.
+            // Dragging a junction resizes several panes at once; the separators themselves stay
+            // draggable.
             .draggable_separator_junctions(false)
             .show_inside(ui, &mut viewer);
-        clamp_connections_width(dock, width);
     }
 
     fn schedule_repaint(&self, ctx: &egui::Context) {
@@ -944,7 +906,6 @@ impl EmbDbgApp {
 /// Draws the tabs of the dock area. Borrows exactly the parts of [`EmbDbgApp`] the tabs need.
 struct DockViewer<'a> {
     engine: &'a Arc<Engine>,
-    connections: &'a mut ConnectionsState,
     channels: &'a mut ChannelUi,
     log: &'a mut LogBuffer,
     wave: &'a mut WaveView,
@@ -972,13 +933,6 @@ impl egui_dock::TabViewer for DockViewer<'_> {
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut Tab) {
         match tab {
-            Tab::Connections => {
-                if let panels::connections::Action::Failed(error) =
-                    panels::connections::ui(ui, self.engine, self.connections)
-                {
-                    self.log.error(error);
-                }
-            }
             Tab::Waveform => {
                 let shared = self.engine.active_shared();
                 let data = shared.channels.read();
@@ -1019,10 +973,10 @@ impl egui_dock::TabViewer for DockViewer<'_> {
         }
     }
 
-    /// The two side panels can be closed, from their tabs or from the toolbar; the data views
-    /// stay. `set_connections_panel` and `set_channels_panel` reopen them.
+    /// The channel table can be closed, from its tab or from the toolbar; the data views stay.
+    /// `set_channels_panel` reopens it.
     fn is_closeable(&self, tab: &Tab) -> bool {
-        matches!(tab, Tab::Connections | Tab::Inspector)
+        matches!(tab, Tab::Inspector)
     }
 }
 
@@ -1202,6 +1156,39 @@ impl eframe::App for EmbDbgApp {
             .exact_size(STATUSBAR_HEIGHT)
             .frame(bar())
             .show(ui, |ui| self.status_bar(ui));
+        // The connection sidebar is a fixed, adaptive panel rather than a dock leaf: the divider
+        // next to it could be dragged away, and its width would be saved as whatever was left.
+        if self.connections_open {
+            let width = connections_width(ui.available_width());
+            egui::Panel::left("connections-panel")
+                .exact_size(width)
+                .resizable(false)
+                .frame(
+                    Frame::new()
+                        .fill(theme::BG_PANEL)
+                        .inner_margin(Margin::symmetric(10, 8)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("连接").strong());
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("×").on_hover_text("隐藏连接栏").clicked() {
+                                self.connections_open = false;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if let panels::connections::Action::Failed(error) =
+                                panels::connections::ui(ui, &self.engine, &mut self.connections)
+                            {
+                                self.log.error(error);
+                            }
+                        });
+                });
+        }
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG_WINDOW))
             .show(ui, |ui| self.show_dock(ui));
@@ -1294,7 +1281,7 @@ impl EmbDbgApp {
             return;
         }
         self.layout_checked = Instant::now();
-        let Ok(text) = crate::layout::serialize(&self.dock) else {
+        let Ok(text) = crate::layout::serialize(&self.dock, self.connections_open) else {
             return;
         };
         if !force && text == self.saved_layout {
@@ -1405,7 +1392,6 @@ mod tests {
         let mut tabs: Vec<Tab> = dock.main_surface().tabs().copied().collect();
         tabs.sort_by_key(|tab| tab.title());
         let mut expected = [
-            Tab::Connections,
             Tab::Waveform,
             Tab::Xy,
             Tab::Spectrum,
@@ -1431,7 +1417,7 @@ mod tests {
         assert!(!channels_panel_open(&dock));
         // Everything else stays in the layout.
         let tabs: Vec<Tab> = dock.main_surface().tabs().copied().collect();
-        assert_eq!(tabs.len(), 11);
+        assert_eq!(tabs.len(), 10);
         assert!(!tabs.contains(&Tab::Inspector));
 
         set_channels_panel(&mut dock, true);
@@ -1448,47 +1434,12 @@ mod tests {
     }
 
     #[test]
-    fn the_connections_panel_closes_and_reopens_on_the_left() {
-        let mut dock = default_dock();
-        assert!(connections_panel_open(&dock));
-
-        set_connections_panel(&mut dock, false);
-        assert!(!connections_panel_open(&dock));
-        assert_eq!(dock.main_surface().tabs().count(), 11);
-
-        set_connections_panel(&mut dock, true);
-        assert!(connections_panel_open(&dock));
-        let tree = dock.main_surface();
-        let root = egui_dock::NodeIndex::root();
-        assert!(tree[root].is_horizontal());
-        let left: Vec<Tab> = tree[root.left()]
-            .tabs()
-            .map(<[Tab]>::to_vec)
-            .unwrap_or_default();
-        assert_eq!(left, [Tab::Connections]);
-    }
-
-    #[test]
-    fn the_connections_sidebar_keeps_a_sane_width() {
-        let mut dock = default_dock();
-        let root = egui_dock::NodeIndex::root();
-        let set = |dock: &mut egui_dock::DockState<Tab>, fraction: f32| {
-            if let egui_dock::Node::Horizontal(split) = &mut dock.main_surface_mut()[root] {
-                split.fraction = fraction;
-            }
-        };
-        let get = |dock: &egui_dock::DockState<Tab>| match &dock.main_surface()[root] {
-            egui_dock::Node::Horizontal(split) => split.fraction,
-            _ => panic!("the root should be the sidebar split"),
-        };
-
-        set(&mut dock, 0.95);
-        clamp_connections_width(&mut dock, 1000.0);
-        assert!(get(&dock) <= 0.4 + 1e-4, "fraction {}", get(&dock));
-
-        set(&mut dock, 0.01);
-        clamp_connections_width(&mut dock, 1000.0);
-        assert!(get(&dock) >= 0.2 - 1e-4, "fraction {}", get(&dock));
+    fn the_connections_sidebar_keeps_a_fixed_adaptive_width() {
+        assert_eq!(connections_width(800.0), CONNECTIONS_MIN_WIDTH);
+        assert!(connections_width(1600.0) > CONNECTIONS_MIN_WIDTH);
+        assert_eq!(connections_width(4000.0), CONNECTIONS_MAX_WIDTH);
+        // A small window takes the room from the sidebar, not from the middle.
+        assert!(connections_width(400.0) <= 160.0 + 1e-3);
     }
 
     #[test]
@@ -1531,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_layout_puts_the_sidebar_left_the_channels_right_and_the_log_below() {
+    fn the_default_layout_puts_the_channels_right_and_the_log_below() {
         let dock = default_dock();
         let tree = dock.main_surface();
         // The tree is stored as a binary tree; `left` is the first child in layout order.
@@ -1540,13 +1491,9 @@ mod tests {
         };
         let root = egui_dock::NodeIndex::root();
         assert!(tree[root].is_horizontal());
-        assert_eq!(tabs_at(root.left()), [Tab::Connections]);
+        assert_eq!(tabs_at(root.right()), [Tab::Inspector]);
 
-        let rest = root.right();
-        assert!(tree[rest].is_horizontal());
-        assert_eq!(tabs_at(rest.right()), [Tab::Inspector]);
-
-        let center = rest.left();
+        let center = root.left();
         assert!(tree[center].is_vertical());
         assert_eq!(
             tabs_at(center.left()),

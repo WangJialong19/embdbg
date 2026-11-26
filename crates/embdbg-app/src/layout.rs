@@ -1,5 +1,5 @@
 //! The window layout that survives a restart: which tabs are open, where they sit, which one is
-//! in front, and how the space is divided.
+//! in front, how the space is divided, and whether the connection sidebar is shown.
 //!
 //! It is kept apart from the settings: `layout.json` is written whenever the dock changes, and a
 //! file this build cannot use is ignored rather than repaired, so a bad edit never loses tabs.
@@ -11,11 +11,28 @@ use anyhow::Context;
 use egui_dock::DockState;
 use serde::{Deserialize, Serialize};
 
-use crate::app::Tab;
+use crate::app::{Tab, default_dock};
 use crate::logging;
 
 /// Bumped when the meaning of a saved layout changes; older files then fall back to the default.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
+
+/// The parts of the window that are restored: the dock and whether the connection sidebar is
+/// shown. The sidebar is a plain panel rather than a dock tab, so its visibility is saved here.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    pub dock: DockState<Tab>,
+    pub connections_open: bool,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            dock: default_dock(),
+            connections_open: true,
+        }
+    }
+}
 
 /// Every tab except the two closable side panels: those may be missing from a saved layout.
 const REQUIRED: [Tab; 10] = [
@@ -35,12 +52,14 @@ const REQUIRED: [Tab; 10] = [
 struct Saved<'a> {
     version: u32,
     dock: &'a DockState<Tab>,
+    connections_open: bool,
 }
 
 #[derive(Deserialize)]
 struct Loaded {
     version: u32,
     dock: DockState<Tab>,
+    connections_open: bool,
 }
 
 /// `%LOCALAPPDATA%\embdbg\layout.json` on Windows, the equivalent elsewhere.
@@ -49,11 +68,11 @@ pub fn path() -> Option<PathBuf> {
 }
 
 /// Reads the saved layout, if there is one this build understands.
-pub fn load() -> Option<DockState<Tab>> {
+pub fn load() -> Option<Layout> {
     path().and_then(|path| load_from(&path))
 }
 
-fn load_from(path: &Path) -> Option<DockState<Tab>> {
+fn load_from(path: &Path) -> Option<Layout> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
@@ -77,9 +96,7 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
             return None;
         }
     };
-    // Version 2 layouts predate the AI and network-tool tabs; they are upgraded in place below,
-    // so a window that was arranged by hand keeps its arrangement.
-    if loaded.version < 1 || loaded.version > VERSION {
+    if loaded.version != VERSION {
         tracing::warn!(
             target: "embdbg::layout",
             "布局版本 {} 与当前 {} 不兼容，使用默认布局",
@@ -90,7 +107,6 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
     }
     let mut dock = loaded.dock;
     expand(&mut dock);
-    add_missing_tabs(&mut dock);
     if !is_usable(&dock) {
         tracing::warn!(
             target: "embdbg::layout",
@@ -99,7 +115,10 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
         );
         return None;
     }
-    Some(dock)
+    Some(Layout {
+        dock,
+        connections_open: loaded.connections_open,
+    })
 }
 
 /// The layout's text, so an unchanged layout is not written again.
@@ -107,7 +126,7 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
 /// Node rectangles are runtime layout, recomputed on every show, and start out infinite — which
 /// JSON cannot represent. They are zeroed in the copy that is saved, so the file depends only on
 /// what the user arranged, not on the window size.
-pub fn serialize(dock: &DockState<Tab>) -> anyhow::Result<String> {
+pub fn serialize(dock: &DockState<Tab>, connections_open: bool) -> anyhow::Result<String> {
     let mut dock = dock.clone();
     expand(&mut dock);
     for surface in dock.iter_surfaces_mut() {
@@ -121,6 +140,7 @@ pub fn serialize(dock: &DockState<Tab>) -> anyhow::Result<String> {
     serde_json::to_string_pretty(&Saved {
         version: VERSION,
         dock: &dock,
+        connections_open,
     })
     .context("序列化布局失败")
 }
@@ -136,31 +156,6 @@ fn write_to(path: &Path, text: &str) -> anyhow::Result<()> {
             .with_context(|| format!("创建布局目录失败：{}", parent.display()))?;
     }
     std::fs::write(path, text).with_context(|| format!("写入布局失败：{}", path.display()))
-}
-
-/// Whether the layout is one this build can use: every required tab exactly once, and at most
-/// one of each side panel. Anything else (a layout from another version, a hand-edited file)
-/// falls back to the default instead of starting with tabs missing.
-/// Adds tabs introduced after the layout was saved, next to the waveform tab, so an older
-/// layout keeps everything else exactly where it was.
-fn add_missing_tabs(dock: &mut DockState<Tab>) {
-    let center = dock
-        .main_surface()
-        .find_tab(&Tab::Waveform)
-        .map(|(node, _)| node);
-    for tab in [Tab::Ai, Tab::Tools] {
-        if dock.find_tab(&tab).is_some() {
-            continue;
-        }
-        if let Some(node) = center {
-            if let Some(leaf) = dock.main_surface_mut()[node].get_leaf_mut() {
-                let index = leaf.tabs().len();
-                leaf.insert_tab(index, tab);
-            }
-        } else {
-            dock.push_to_focused_leaf(tab);
-        }
-    }
 }
 
 /// Undoes egui_dock's pane folding. A saved layout should never reopen as a blank strip, and a
@@ -179,6 +174,9 @@ fn expand(dock: &mut DockState<Tab>) {
     }
 }
 
+/// Whether the layout is one this build can use: every required tab exactly once, and at most
+/// one of each side panel. Anything else (a layout from another version, a hand-edited file)
+/// falls back to the default instead of starting with tabs missing.
 fn is_usable(dock: &DockState<Tab>) -> bool {
     let mut seen = HashSet::new();
     for surface in dock.iter_surfaces() {
@@ -209,17 +207,23 @@ mod tests {
     fn a_layout_round_trips_with_the_channel_table_closed() {
         let mut dock = default_dock();
         crate::app::set_channels_panel(&mut dock, false);
-        let text = serialize(&dock).unwrap();
+        let text = serialize(&dock, true).unwrap();
 
         let dir = temp_dir();
         let path = dir.join("layout.json");
         write_to(&path, &text).unwrap();
         let loaded = load_from(&path).expect("a saved layout loads");
         assert_eq!(
-            loaded.main_surface().tabs().copied().collect::<Vec<Tab>>(),
+            loaded
+                .dock
+                .main_surface()
+                .tabs()
+                .copied()
+                .collect::<Vec<Tab>>(),
             dock.main_surface().tabs().copied().collect::<Vec<Tab>>()
         );
-        assert!(!crate::app::channels_panel_open(&loaded));
+        assert!(!crate::app::channels_panel_open(&loaded.dock));
+        assert!(loaded.connections_open);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -239,13 +243,18 @@ mod tests {
             egui_dock::TabIndex(0)
         );
 
-        let text = serialize(&dock).unwrap();
+        let text = serialize(&dock, true).unwrap();
         let dir = temp_dir();
         let path = dir.join("layout.json");
         write_to(&path, &text).unwrap();
         let loaded = load_from(&path).expect("a saved layout loads");
         assert_eq!(
-            loaded.main_surface().find_tab(&Tab::Terminal).unwrap().1,
+            loaded
+                .dock
+                .main_surface()
+                .find_tab(&Tab::Terminal)
+                .unwrap()
+                .1,
             egui_dock::TabIndex(0)
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -256,13 +265,13 @@ mod tests {
         let mut dock = default_dock();
         let (node, _) = dock
             .main_surface()
-            .find_tab(&Tab::Connections)
-            .expect("the sidebar is in the default layout");
+            .find_tab(&Tab::Inspector)
+            .expect("the channel table is in the default layout");
         dock.main_surface_mut()[node].set_collapsed(true);
         assert!(dock.main_surface()[node].is_collapsed());
 
         // Saving never keeps the folded state, so a blank strip cannot be restored.
-        let text = serialize(&dock).unwrap();
+        let text = serialize(&dock, true).unwrap();
         let parsed: Loaded = serde_json::from_str(&text).unwrap();
         assert!(!parsed.dock.main_surface()[node].is_collapsed());
 
@@ -270,47 +279,21 @@ mod tests {
         let path = dir.join("layout.json");
         write_to(&path, &text).unwrap();
         let loaded = load_from(&path).expect("a saved layout loads");
-        assert!(!loaded.main_surface()[node].is_collapsed());
+        assert!(!loaded.dock.main_surface()[node].is_collapsed());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_layout_with_both_side_panels_closed_round_trips() {
+    fn the_sidebar_visibility_round_trips() {
         let mut dock = default_dock();
         crate::app::set_channels_panel(&mut dock, false);
-        crate::app::set_connections_panel(&mut dock, false);
-        let text = serialize(&dock).unwrap();
+        let text = serialize(&dock, false).unwrap();
         let dir = temp_dir();
         let path = dir.join("layout.json");
         write_to(&path, &text).unwrap();
         let loaded = load_from(&path).expect("a layout without the side panels loads");
-        assert!(!crate::app::channels_panel_open(&loaded));
-        assert!(!crate::app::connections_panel_open(&loaded));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_older_layout_gains_the_new_tabs_without_losing_its_arrangement() {
-        let mut dock = default_dock();
-        for tab in [Tab::Ai, Tab::Tools] {
-            if let Some(path) = dock.find_tab(&tab) {
-                dock.remove_tab(path);
-            }
-        }
-        let text = serialize(&dock).unwrap().replacen(
-            &format!("\"version\": {VERSION}"),
-            "\"version\": 2",
-            1,
-        );
-
-        let dir = temp_dir();
-        let path = dir.join("layout.json");
-        write_to(&path, &text).unwrap();
-        let loaded = load_from(&path).expect("an older layout should be upgraded");
-        assert!(loaded.find_tab(&Tab::Ai).is_some());
-        assert!(loaded.find_tab(&Tab::Tools).is_some());
-        // The tab that was there keeps its place in the center stack.
-        assert!(loaded.find_tab(&Tab::Waveform).is_some());
+        assert!(!crate::app::channels_panel_open(&loaded.dock));
+        assert!(!loaded.connections_open);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -321,7 +304,7 @@ mod tests {
         if let Some(path) = dock.find_tab(&Tab::Waveform) {
             dock.remove_tab(path);
         }
-        let text = serialize(&dock).unwrap();
+        let text = serialize(&dock, true).unwrap();
         let dir = temp_dir();
         let path = dir.join("layout.json");
         write_to(&path, &text).unwrap();
@@ -332,7 +315,7 @@ mod tests {
     #[test]
     fn a_layout_from_another_version_is_refused() {
         let dock = default_dock();
-        let text = serialize(&dock).unwrap().replacen(
+        let text = serialize(&dock, true).unwrap().replacen(
             &format!("\"version\": {VERSION}"),
             "\"version\": 99",
             1,

@@ -136,6 +136,26 @@ impl Drop for SerialLink {
     }
 }
 
+/// A message for a failed open.
+///
+/// Windows reports both a port held by another program and a port that does not exist as
+/// `NoDevice`, so the port list decides which one it was: a port that is still listed could not
+/// be opened because something else holds it.
+fn open_error_message(port: &str, error: &serialport::Error, listed: bool) -> String {
+    match error.kind() {
+        serialport::ErrorKind::NoDevice if listed => {
+            format!("打开串口 {port} 失败：端口被其他程序占用，请关闭正在使用它的程序")
+        }
+        serialport::ErrorKind::NoDevice => format!(
+            "打开串口 {port} 失败：系统里没有这个端口，设备可能已拔出或端口号变了，点刷新重新扫描"
+        ),
+        serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied) => format!(
+            "打开串口 {port} 失败：没有权限访问这个端口，可能被其他程序占用，或当前用户不在串口用户组里（{error}）"
+        ),
+        _ => format!("打开串口 {port} 失败：{error}"),
+    }
+}
+
 /// Opens the port and starts reading it. The first error after the port is open ends the thread.
 pub fn open(
     config: &SerialConfig,
@@ -167,7 +187,14 @@ pub fn open(
         // Short enough that writes are handled promptly, long enough not to spin.
         .timeout(Duration::from_millis(10))
         .open()
-        .map_err(|error| format!("打开串口 {} 失败：{error}", config.port))?;
+        .map_err(|error| {
+            // Windows reports "in use" and "no such port" with the same error kind; a port that
+            // is still in the list was therefore taken by another program.
+            let listed = list_ports()
+                .iter()
+                .any(|info| info.name.eq_ignore_ascii_case(&config.port));
+            open_error_message(&config.port, &error, listed)
+        })?;
 
     let (writes, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -242,5 +269,26 @@ mod tests {
         };
         let error = open(&config, events, Clock::new()).unwrap_err();
         assert!(error.contains("COM-not-there"), "{error}");
+    }
+
+    #[test]
+    fn a_listed_port_that_will_not_open_is_called_occupied() {
+        let error = serialport::Error::new(serialport::ErrorKind::NoDevice, "拒绝访问。");
+        let busy = open_error_message("COM5", &error, true);
+        assert!(busy.contains("被其他程序占用"), "{busy}");
+        assert!(busy.contains("COM5"), "{busy}");
+        let missing = open_error_message("COM5", &error, false);
+        assert!(missing.contains("没有这个端口"), "{missing}");
+    }
+
+    #[test]
+    fn a_permission_error_suggests_the_serial_group() {
+        let error = serialport::Error::new(
+            serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied),
+            "Permission denied",
+        );
+        let message = open_error_message("ttyUSB0", &error, true);
+        assert!(message.contains("没有权限"), "{message}");
+        assert!(message.contains("用户组"), "{message}");
     }
 }
