@@ -12,6 +12,56 @@ use vt100::Parser;
 /// How many lines scroll back above the visible screen.
 const SCROLLBACK_LINES: usize = 5_000;
 
+/// How text bytes become characters on screen.
+///
+/// UTF-8 goes straight to the parser, which already understands it. The others are decoded first,
+/// so a GBK console shows readable Chinese instead of mojibake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextEncoding {
+    #[default]
+    Utf8,
+    Gbk,
+    Gb18030,
+    Latin1,
+}
+
+impl TextEncoding {
+    pub const ALL: [Self; 4] = [Self::Utf8, Self::Gbk, Self::Gb18030, Self::Latin1];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf-8",
+            Self::Gbk => "gbk",
+            Self::Gb18030 => "gb18030",
+            Self::Latin1 => "latin1",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Gbk => "GBK",
+            Self::Gb18030 => "GB18030",
+            Self::Latin1 => "Latin-1",
+        }
+    }
+
+    /// Reads back an id written by [`Self::id`], for the saved settings.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|encoding| encoding.id() == id)
+    }
+
+    /// The codec behind a non-UTF-8 encoding; UTF-8 needs none.
+    fn codec(self) -> Option<&'static encoding_rs::Encoding> {
+        match self {
+            Self::Utf8 => None,
+            Self::Gbk => Some(encoding_rs::GBK),
+            Self::Gb18030 => Some(encoding_rs::GB18030),
+            Self::Latin1 => Some(encoding_rs::WINDOWS_1252),
+        }
+    }
+}
+
 /// A terminal emulator sized in character cells.
 pub struct Terminal {
     parser: Parser,
@@ -19,6 +69,12 @@ pub struct Terminal {
     cols: u16,
     /// How far back into the scrollback the view is; 0 is the live screen.
     offset: usize,
+    /// How received bytes become text.
+    encoding: TextEncoding,
+    /// The incremental decoder of a non-UTF-8 encoding.
+    decoder: Option<encoding_rs::Decoder>,
+    /// Bytes of a character the last read ended in the middle of.
+    pending: Vec<u8>,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -39,6 +95,9 @@ impl Terminal {
             rows,
             cols,
             offset: 0,
+            encoding: TextEncoding::default(),
+            decoder: None,
+            pending: Vec::new(),
         }
     }
 
@@ -50,7 +109,46 @@ impl Terminal {
         if bytes.is_empty() {
             return;
         }
-        self.parser.process(bytes);
+        let Some(codec) = self.encoding.codec() else {
+            self.parser.process(bytes);
+            return;
+        };
+        // A read can end in the middle of a multi-byte character; keep the tail for next time.
+        self.pending.extend_from_slice(bytes);
+        let decoder = self
+            .decoder
+            .get_or_insert_with(|| codec.new_decoder_without_bom_handling());
+        let mut offset = 0;
+        while offset < self.pending.len() {
+            let mut text = String::with_capacity((self.pending.len() - offset) * 2 + 8);
+            let (result, read, _) =
+                decoder.decode_to_string(&self.pending[offset..], &mut text, false);
+            if read == 0 {
+                break;
+            }
+            offset += read;
+            self.parser.process(text.as_bytes());
+            if matches!(result, encoding_rs::CoderResult::InputEmpty) {
+                break;
+            }
+        }
+        self.pending.drain(..offset);
+    }
+
+    /// Switches how received bytes become text. The screen starts over: what was shown was
+    /// decoded the old way.
+    pub fn set_encoding(&mut self, encoding: TextEncoding) {
+        if encoding == self.encoding {
+            return;
+        }
+        self.encoding = encoding;
+        self.decoder = None;
+        self.pending.clear();
+        self.clear();
+    }
+
+    pub fn encoding(&self) -> TextEncoding {
+        self.encoding
     }
 
     /// Changes the screen size; the widget calls this when its own size changes.
@@ -69,6 +167,7 @@ impl Terminal {
     pub fn clear(&mut self) {
         self.parser = Parser::new(nonzero(self.rows), nonzero(self.cols), SCROLLBACK_LINES);
         self.offset = 0;
+        self.pending.clear();
     }
 
     pub fn rows(&self) -> u16 {
@@ -232,5 +331,38 @@ mod tests {
         terminal.feed("中文 ok\r\n".as_bytes());
         let lines = text_of(&terminal);
         assert!(lines[0].starts_with("中文 ok"), "{lines:?}");
+    }
+
+    #[test]
+    fn gbk_text_is_decoded_before_it_reaches_the_cells() {
+        let mut terminal = Terminal::new(4, 20);
+        terminal.set_encoding(TextEncoding::Gbk);
+        // "中文" in GBK.
+        terminal.feed(&[0xd6, 0xd0, 0xce, 0xc4]);
+        assert!(
+            text_of(&terminal)[0].starts_with("中文"),
+            "{:?}",
+            text_of(&terminal)
+        );
+    }
+
+    #[test]
+    fn a_split_character_waits_for_its_other_half() {
+        let mut terminal = Terminal::new(4, 20);
+        terminal.set_encoding(TextEncoding::Gbk);
+        terminal.feed(&[0xd6]);
+        assert!(terminal.contents().trim().is_empty());
+        terminal.feed(&[0xd0]);
+        assert_eq!(text_of(&terminal)[0], "中");
+    }
+
+    #[test]
+    fn switching_the_encoding_starts_the_screen_over() {
+        let mut terminal = Terminal::new(4, 20);
+        terminal.feed(b"old");
+        assert_eq!(text_of(&terminal)[0], "old");
+        terminal.set_encoding(TextEncoding::Gbk);
+        assert!(terminal.contents().trim().is_empty());
+        assert_eq!(terminal.encoding(), TextEncoding::Gbk);
     }
 }

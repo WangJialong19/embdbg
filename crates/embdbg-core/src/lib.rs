@@ -10,4 +10,5 @@ pub mod engine;
 pub mod mcp;
 pub mod pipeline;
 pub mod platform;
+pub mod plugins;
 pub mod transport;

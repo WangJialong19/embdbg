@@ -18,7 +18,6 @@ use crate::icons::outline;
 use crate::panels;
 use crate::panels::ai::AiState;
 use crate::panels::connections::ConnectionsState;
-use crate::panels::hex::HexState;
 use crate::panels::histogram::HistogramState;
 use crate::panels::inspector::ChannelUi;
 use crate::panels::log::LogBuffer;
@@ -44,6 +43,8 @@ const INSPECTOR_SPLIT: f32 = 0.56;
 const CONNECTIONS_WIDTH_SHARE: f32 = 0.20;
 const CONNECTIONS_MIN_WIDTH: f32 = 240.0;
 const CONNECTIONS_MAX_WIDTH: f32 = 340.0;
+/// The slim strip on the sidebar's edge that holds the fold/unfold arrow.
+const SIDEBAR_STRIP_WIDTH: f32 = 10.0;
 
 /// How often the window repaints when nothing streams, just to notice state changes.
 const IDLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -81,6 +82,8 @@ pub struct WindowSettings {
     /// A serial port to open right away.
     pub startup_serial: Option<SerialConfig>,
     pub startup_decoder: DecoderSpec,
+    /// Extra plugin directories from the command line, highest priority.
+    pub plugin_dirs: Vec<PathBuf>,
     /// Whether this run may write the layout. Screenshot and performance runs keep their hands
     /// off the user's saved window.
     pub persist_layout: bool,
@@ -95,7 +98,6 @@ pub(crate) enum Tab {
     Spectrum,
     Histogram,
     Terminal,
-    Hex,
     Ai,
     Tools,
     Send,
@@ -112,7 +114,6 @@ impl Tab {
             "spectrum" | "fft" => Self::Spectrum,
             "histogram" | "hist" => Self::Histogram,
             "terminal" => Self::Terminal,
-            "hex" => Self::Hex,
             "ai" | "mcp" => Self::Ai,
             "tools" | "net" | "network" => Self::Tools,
             "send" => Self::Send,
@@ -129,7 +130,6 @@ impl Tab {
             Tab::Spectrum => "频谱",
             Tab::Histogram => "直方图",
             Tab::Terminal => "终端",
-            Tab::Hex => "十六进制",
             Tab::Ai => "AI",
             Tab::Tools => "网络工具",
             Tab::Send => "发送",
@@ -159,12 +159,11 @@ pub(crate) fn default_dock() -> egui_dock::DockState<Tab> {
     use egui_dock::NodeIndex;
 
     let mut dock = egui_dock::DockState::new(vec![
+        Tab::Terminal,
         Tab::Waveform,
         Tab::Xy,
         Tab::Spectrum,
         Tab::Histogram,
-        Tab::Terminal,
-        Tab::Hex,
         Tab::Ai,
         Tab::Tools,
     ]);
@@ -184,6 +183,73 @@ fn connections_width(available: f32) -> f32 {
     (available * CONNECTIONS_WIDTH_SHARE)
         .clamp(CONNECTIONS_MIN_WIDTH, CONNECTIONS_MAX_WIDTH)
         .min(available * 0.4)
+}
+
+/// The plugin directories in scan order: command-line extras first, then the user's, then the
+/// one next to the program.
+pub(crate) fn plugin_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs = extra.to_vec();
+    if let Some(dir) = crate::logging::app_data_dir() {
+        dirs.push(dir.join("plugins"));
+    }
+    dirs.extend(embdbg_core::plugins::default_dirs());
+    dirs
+}
+
+/// Draws the fold/unfold handle on the sidebar's edge. Returns true when it is clicked.
+///
+/// This is a splitter handle rather than a button: at rest it is just the boundary line with a
+/// faint arrow, and the whole edge lights up under the pointer.
+fn sidebar_toggle(ui: &mut Ui, expanded: bool) -> bool {
+    let size = vec2(ui.available_width(), ui.available_height());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = response.hovered();
+    let painter = ui.painter();
+    if hovered {
+        painter.rect_filled(
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.right() - 1.0, rect.bottom())),
+            egui::CornerRadius::ZERO,
+            theme::BG_HOVER.gamma_multiply(0.55),
+        );
+    }
+    // The edge itself: a quiet line that brightens when the pointer is on it.
+    painter.vline(
+        rect.right() - 0.5,
+        rect.y_range(),
+        egui::Stroke::new(
+            1.0,
+            if hovered {
+                theme::FG_DIM
+            } else {
+                theme::BORDER
+            },
+        ),
+    );
+    // Expanded points left, to fold the sidebar; collapsed points right, to unfold it.
+    let center = rect.center();
+    let tip = center.x + if expanded { -4.0 } else { 4.0 };
+    let back = center.x - if expanded { -4.0 } else { 4.0 };
+    let color = if hovered {
+        theme::FG
+    } else {
+        theme::FG_DIM.gamma_multiply(0.55)
+    };
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(back, center.y - 5.0),
+            egui::pos2(tip, center.y),
+            egui::pos2(back, center.y + 5.0),
+        ],
+        egui::Stroke::new(1.6, color),
+    ));
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(if expanded {
+            "收起连接栏"
+        } else {
+            "展开连接栏"
+        })
+        .clicked()
 }
 
 /// Whether the channel table is part of the layout.
@@ -230,6 +296,7 @@ pub fn run(
         initial_tab: cli.tab.clone(),
         startup_serial,
         startup_decoder,
+        plugin_dirs: cli.plugin_dirs.clone(),
         persist_layout: cli.screenshot.is_none() && cli.perf_test.is_none(),
     };
 
@@ -551,7 +618,6 @@ pub struct EmbDbgApp {
     channels: ChannelUi,
     log: LogBuffer,
     terminal: TerminalState,
-    hex: HexState,
     send: SendState,
     xy: XyState,
     spectrum: SpectrumState,
@@ -565,6 +631,12 @@ pub struct EmbDbgApp {
     screenshot: Option<ScreenshotRequest>,
     /// Whether the settings window is open.
     settings_open: bool,
+    /// Which page the settings window shows.
+    settings_page: panels::settings::Page,
+    /// Result of the last plugin install or uninstall, shown in the settings window.
+    plugin_notice: Option<(String, bool)>,
+    /// The plugin the user asked to uninstall, waiting for a second click.
+    confirm_uninstall: Option<String>,
     /// The edits in that window, saved on request.
     pending: Settings,
     /// What is currently in the settings file.
@@ -666,8 +738,10 @@ impl EmbDbgApp {
             connections_open: layout.connections_open,
             connections: ConnectionsState::from_form(form.clone()),
             channels: ChannelUi::default(),
-            terminal: TerminalState::with_names(saved.terminal_names.clone()),
-            hex: HexState::default(),
+            terminal: TerminalState::with_saved(
+                saved.terminal_names.clone(),
+                saved.terminal_views.clone(),
+            ),
             send: SendState::with_macros(macros),
             xy: XyState::default(),
             spectrum: SpectrumState::default(),
@@ -681,6 +755,9 @@ impl EmbDbgApp {
             perf_test,
             screenshot,
             settings_open: open_settings,
+            settings_page: panels::settings::Page::default(),
+            plugin_notice: None,
+            confirm_uninstall: None,
             pending,
             saved,
             persist_layout,
@@ -712,20 +789,6 @@ impl EmbDbgApp {
                     self.settings_open = !self.settings_open;
                 }
                 ui.separator();
-                let connections_open = self.connections_open;
-                let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR, "连接", 13.5))
-                    .selected(connections_open);
-                if ui
-                    .add(toggle)
-                    .on_hover_text(if connections_open {
-                        "隐藏左侧的连接栏"
-                    } else {
-                        "显示左侧的连接栏"
-                    })
-                    .clicked()
-                {
-                    self.connections_open = !connections_open;
-                }
                 let open = channels_panel_open(&self.dock);
                 let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR_RIGHT, "通道", 13.5))
                     .selected(open);
@@ -812,7 +875,6 @@ impl EmbDbgApp {
             wave,
             wave_scratch,
             terminal,
-            hex,
             send,
             xy,
             spectrum,
@@ -828,7 +890,6 @@ impl EmbDbgApp {
             wave,
             wave_scratch,
             terminal,
-            hex,
             send,
             xy,
             spectrum,
@@ -841,7 +902,7 @@ impl EmbDbgApp {
             // The tab's own close button is enough; a second one for the whole pane is noise.
             .show_leaf_close_all_buttons(false)
             // The arrow egui_dock puts at the left of a tab bar folds the pane into a blank strip.
-            // Hiding is what the toolbar toggle and the tab's close button do instead.
+            // The edge arrow next to the connection sidebar folds it instead.
             .show_leaf_collapse_buttons(false)
             // Dragging a junction resizes several panes at once; the separators themselves stay
             // draggable.
@@ -911,7 +972,6 @@ struct DockViewer<'a> {
     wave: &'a mut WaveView,
     wave_scratch: &'a mut WaveScratch,
     terminal: &'a mut TerminalState,
-    hex: &'a mut HexState,
     send: &'a mut SendState,
     xy: &'a mut XyState,
     spectrum: &'a mut SpectrumState,
@@ -952,16 +1012,10 @@ impl egui_dock::TabViewer for DockViewer<'_> {
                 panels::histogram::ui(ui, &shared, self.histogram);
             }
             Tab::Terminal => panels::terminal::ui(ui, self.engine, self.terminal),
-            Tab::Hex => {
-                let shared = self.engine.active_shared();
-                panels::hex::ui(ui, &shared, self.hex);
-            }
-            Tab::Ai => panels::ai::ui(ui, self.ai),
+            Tab::Ai => panels::ai::ui(ui, self.ai, self.engine),
             Tab::Tools => panels::net_tools::ui(ui, self.net, self.engine),
             Tab::Send => {
-                let active = self.engine.active();
-                if let Some(error) = panels::send::ui(ui, self.engine, active.as_deref(), self.send)
-                {
+                if let Some(error) = panels::send::ui(ui, self.engine, self.send) {
                     self.log.error(error);
                 }
             }
@@ -1169,14 +1223,7 @@ impl eframe::App for EmbDbgApp {
                         .inner_margin(Margin::symmetric(10, 8)),
                 )
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("连接").strong());
-                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("×").on_hover_text("隐藏连接栏").clicked() {
-                                self.connections_open = false;
-                            }
-                        });
-                    });
+                    ui.label(RichText::new("连接").strong());
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
@@ -1189,6 +1236,17 @@ impl eframe::App for EmbDbgApp {
                         });
                 });
         }
+        // The edge strip is always there: the arrow folds the sidebar, and the rail it leaves
+        // behind is what unfolds it again.
+        egui::Panel::left("connections-toggle")
+            .exact_size(SIDEBAR_STRIP_WIDTH)
+            .resizable(false)
+            .frame(Frame::new().fill(theme::BG_PANEL))
+            .show(ui, |ui| {
+                if sidebar_toggle(ui, self.connections_open) {
+                    self.connections_open = !self.connections_open;
+                }
+            });
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG_WINDOW))
             .show(ui, |ui| self.show_dock(ui));
@@ -1201,6 +1259,9 @@ impl eframe::App for EmbDbgApp {
         }
         if self.terminal.take_names_changed() {
             self.save_terminal_names();
+        }
+        if self.terminal.take_views_changed() {
+            self.save_terminal_views();
         }
 
         let ctx = ui.ctx().clone();
@@ -1228,6 +1289,9 @@ impl eframe::App for EmbDbgApp {
         if self.terminal.take_names_changed() {
             self.save_terminal_names();
         }
+        if self.terminal.take_views_changed() {
+            self.save_terminal_views();
+        }
     }
 }
 
@@ -1237,11 +1301,16 @@ impl EmbDbgApp {
         if !self.settings_open {
             return;
         }
+        let plugin_dirs = plugin_dirs(&self.settings.plugin_dirs);
         match panels::settings::ui(
             ctx,
             &mut self.settings_open,
             &mut self.pending,
+            &mut self.settings_page,
             &self.backend,
+            &plugin_dirs,
+            &mut self.plugin_notice,
+            &mut self.confirm_uninstall,
         ) {
             panels::settings::Action::None => {}
             panels::settings::Action::Save => self.save_settings(),
@@ -1346,6 +1415,18 @@ impl EmbDbgApp {
         }
     }
 
+    /// Writes the text/hex display and encoding choices of the terminals.
+    fn save_terminal_views(&mut self) {
+        let views = self.terminal.views().clone();
+        let mut next = self.saved.clone();
+        next.terminal_views = views.clone();
+        self.pending.terminal_views = views;
+        match next.save() {
+            Ok(()) => self.saved = next,
+            Err(error) => self.log.error(format!("保存终端显示设置失败：{error}")),
+        }
+    }
+
     /// Starts the program over, which is what a new renderer needs.
     fn restart(&self, ctx: &egui::Context) {
         match std::env::current_exe() {
@@ -1397,7 +1478,6 @@ mod tests {
             Tab::Spectrum,
             Tab::Histogram,
             Tab::Terminal,
-            Tab::Hex,
             Tab::Ai,
             Tab::Tools,
             Tab::Send,
@@ -1417,7 +1497,7 @@ mod tests {
         assert!(!channels_panel_open(&dock));
         // Everything else stays in the layout.
         let tabs: Vec<Tab> = dock.main_surface().tabs().copied().collect();
-        assert_eq!(tabs.len(), 10);
+        assert_eq!(tabs.len(), 9);
         assert!(!tabs.contains(&Tab::Inspector));
 
         set_channels_panel(&mut dock, true);
@@ -1498,12 +1578,11 @@ mod tests {
         assert_eq!(
             tabs_at(center.left()),
             [
+                Tab::Terminal,
                 Tab::Waveform,
                 Tab::Xy,
                 Tab::Spectrum,
                 Tab::Histogram,
-                Tab::Terminal,
-                Tab::Hex,
                 Tab::Ai,
                 Tab::Tools,
             ]

@@ -7,7 +7,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_modbus::client::{Context, rtu, tcp};
 use tokio_modbus::prelude::*;
 
@@ -39,7 +39,7 @@ impl BlockKind {
         }
     }
 
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         match text.to_ascii_lowercase().as_str() {
             "holding" | "hr" | "3" => Some(Self::Holding),
             "input" | "ir" | "4" => Some(Self::Input),
@@ -150,8 +150,26 @@ pub enum ModbusEvent {
     Ended(Option<String>),
 }
 
+/// A read or write asked for between polling cycles.
+#[derive(Debug)]
+pub enum ModbusRequest {
+    Read {
+        kind: BlockKind,
+        start: u16,
+        count: u16,
+        reply: oneshot::Sender<Result<Vec<u16>, String>>,
+    },
+    Write {
+        kind: BlockKind,
+        start: u16,
+        values: Vec<u16>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
 pub struct ModbusLink {
     stop: watch::Sender<bool>,
+    pub requests: UnboundedSender<ModbusRequest>,
 }
 
 impl ModbusLink {
@@ -173,6 +191,7 @@ pub fn spawn(
     clock: Clock,
 ) -> ModbusLink {
     let (stop, mut stop_rx) = watch::channel(false);
+    let (requests, mut request_rx) = mpsc::unbounded_channel::<ModbusRequest>();
     let config = config.clone();
 
     tokio::spawn(async move {
@@ -191,6 +210,10 @@ pub fn spawn(
         loop {
             tokio::select! {
                 _ = stop_rx.changed() => break,
+                request = request_rx.recv() => match request {
+                    Some(request) => handle_request(&mut context, request).await,
+                    None => break,
+                },
                 _ = ticker.tick() => match read_all(&mut context, &config.blocks).await {
                     Ok(values) => {
                         let _ = events.send(ModbusEvent::Samples { t: clock.now(), values });
@@ -206,7 +229,28 @@ pub fn spawn(
         let _ = events.send(ModbusEvent::Ended(None));
     });
 
-    ModbusLink { stop }
+    ModbusLink { stop, requests }
+}
+
+async fn handle_request(context: &mut Context, request: ModbusRequest) {
+    match request {
+        ModbusRequest::Read {
+            kind,
+            start,
+            count,
+            reply,
+        } => {
+            let _ = reply.send(read_block(context, kind, start, count).await);
+        }
+        ModbusRequest::Write {
+            kind,
+            start,
+            values,
+            reply,
+        } => {
+            let _ = reply.send(write_block(context, kind, start, &values).await);
+        }
+    }
 }
 
 async fn connect(config: &ModbusConfig) -> Result<Context, String> {
@@ -234,54 +278,109 @@ async fn connect(config: &ModbusConfig) -> Result<Context, String> {
 async fn read_all(context: &mut Context, blocks: &[ModbusBlock]) -> Result<Vec<f32>, String> {
     let mut values = Vec::new();
     for block in blocks {
-        let error = |error: tokio_modbus::Error| {
-            format!(
-                "读取 {} {}..{} 失败：{error}",
-                block.kind.id(),
-                block.start,
-                block.start + block.count
-            )
-        };
-        match block.kind {
-            BlockKind::Holding => {
-                let words = context
-                    .read_holding_registers(block.start, block.count)
-                    .await
-                    .map_err(error)?
-                    .map_err(|exception| format!("Modbus 异常：{exception:?}"))?;
-                values.extend(words.into_iter().map(f32::from));
-            }
-            BlockKind::Input => {
-                let words = context
-                    .read_input_registers(block.start, block.count)
-                    .await
-                    .map_err(error)?
-                    .map_err(|exception| format!("Modbus 异常：{exception:?}"))?;
-                values.extend(words.into_iter().map(f32::from));
-            }
-            BlockKind::Coil => {
-                let coils = context
-                    .read_coils(block.start, block.count)
-                    .await
-                    .map_err(error)?
-                    .map_err(|exception| format!("Modbus 异常：{exception:?}"))?;
-                values.extend(coils.into_iter().map(|coil| if coil { 1.0 } else { 0.0 }));
-            }
-            BlockKind::Discrete => {
-                let inputs = context
-                    .read_discrete_inputs(block.start, block.count)
-                    .await
-                    .map_err(error)?
-                    .map_err(|exception| format!("Modbus 异常：{exception:?}"))?;
-                values.extend(
-                    inputs
-                        .into_iter()
-                        .map(|input| if input { 1.0 } else { 0.0 }),
-                );
-            }
-        }
+        let words = read_block(context, block.kind, block.start, block.count).await?;
+        values.extend(words.into_iter().map(f32::from));
     }
     Ok(values)
+}
+
+/// Reads one area. Coils and discrete inputs come back as 0 or 1, so every area is a list of
+/// words on the way out.
+async fn read_block(
+    context: &mut Context,
+    kind: BlockKind,
+    start: u16,
+    count: u16,
+) -> Result<Vec<u16>, String> {
+    let failed = |error: tokio_modbus::Error| {
+        format!(
+            "读取 {} {}..{} 失败：{error}",
+            kind.id(),
+            start,
+            start.saturating_add(count)
+        )
+    };
+    let exception = |exception: tokio_modbus::ExceptionCode| format!("Modbus 异常：{exception:?}");
+    match kind {
+        BlockKind::Holding => context
+            .read_holding_registers(start, count)
+            .await
+            .map_err(failed)?
+            .map_err(exception),
+        BlockKind::Input => context
+            .read_input_registers(start, count)
+            .await
+            .map_err(failed)?
+            .map_err(exception),
+        BlockKind::Coil => Ok(context
+            .read_coils(start, count)
+            .await
+            .map_err(failed)?
+            .map_err(exception)?
+            .into_iter()
+            .map(u16::from)
+            .collect()),
+        BlockKind::Discrete => Ok(context
+            .read_discrete_inputs(start, count)
+            .await
+            .map_err(failed)?
+            .map_err(exception)?
+            .into_iter()
+            .map(u16::from)
+            .collect()),
+    }
+}
+
+/// Writes one area. Input registers and discrete inputs are read-only on the wire.
+async fn write_block(
+    context: &mut Context,
+    kind: BlockKind,
+    start: u16,
+    values: &[u16],
+) -> Result<(), String> {
+    let failed = |error: tokio_modbus::Error| {
+        format!(
+            "写 {} {}..{} 失败：{error}",
+            kind.id(),
+            start,
+            start.saturating_add(values.len() as u16)
+        )
+    };
+    let exception = |exception: tokio_modbus::ExceptionCode| format!("Modbus 异常：{exception:?}");
+    match kind {
+        BlockKind::Holding => {
+            if let [word] = values {
+                context
+                    .write_single_register(start, *word)
+                    .await
+                    .map_err(failed)?
+                    .map_err(exception)
+            } else {
+                context
+                    .write_multiple_registers(start, values)
+                    .await
+                    .map_err(failed)?
+                    .map_err(exception)
+            }
+        }
+        BlockKind::Coil => {
+            let coils: Vec<bool> = values.iter().map(|value| *value != 0).collect();
+            if let [coil] = coils[..] {
+                context
+                    .write_single_coil(start, coil)
+                    .await
+                    .map_err(failed)?
+                    .map_err(exception)
+            } else {
+                context
+                    .write_multiple_coils(start, &coils)
+                    .await
+                    .map_err(failed)?
+                    .map_err(exception)
+            }
+        }
+        BlockKind::Input | BlockKind::Discrete => Err(format!("{} 是只读区域，不能写", kind.id())),
+    }
 }
 
 #[cfg(test)]

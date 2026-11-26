@@ -187,10 +187,11 @@ fn hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-pub fn decoder_label(spec: DecoderSpec) -> &'static str {
+pub fn decoder_label(spec: DecoderSpec) -> String {
     match spec {
-        DecoderSpec::Line => "文本行",
-        DecoderSpec::JustFloat => "JustFloat",
-        DecoderSpec::JustInt => "JustInt",
+        DecoderSpec::Line => "文本行".to_owned(),
+        DecoderSpec::JustFloat => "JustFloat".to_owned(),
+        DecoderSpec::JustInt => "JustInt".to_owned(),
+        DecoderSpec::Plugin(slot) => format!("插件 {slot}"),
     }
 }

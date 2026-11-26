@@ -9,16 +9,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{
-    Align, Color32, CursorIcon, Event, EventFilter, FontId, ImeEvent, Key, Layout, Modifiers,
-    PointerButton, Pos2, Rangef, Rect, RichText, Sense, Stroke, TextEdit, Ui, Vec2,
+    Align, Color32, ComboBox, CursorIcon, Event, EventFilter, FontId, ImeEvent, Key, Layout,
+    Modifiers, PointerButton, Pos2, Rangef, Rect, RichText, Sense, Stroke, TextEdit, Ui, Vec2,
     epaint::CornerRadius, output::IMEOutput,
 };
 use embdbg_core::engine::{Connection, ConnectionId, ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::SessionShared;
 use embdbg_core::pipeline::Terminal;
+use embdbg_core::pipeline::TextEncoding;
 use embdbg_core::pipeline::terminal::vt100;
 use embdbg_core::transport::ModbusEndpoint;
 
+use crate::panels::hex::HexState;
+use crate::settings::TerminalViewForm;
 use crate::theme;
 
 /// Font size of the grid.
@@ -54,6 +57,59 @@ impl Selection {
     }
 }
 
+/// Whether a connection's terminal shows decoded text or the raw bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DisplayMode {
+    #[default]
+    Text,
+    Hex,
+}
+
+impl DisplayMode {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Hex => "hex",
+        }
+    }
+
+    fn from_id(id: &str) -> Self {
+        if id == "hex" { Self::Hex } else { Self::Text }
+    }
+}
+
+/// What one connection's terminal shows, and how text is decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewState {
+    mode: DisplayMode,
+    encoding: TextEncoding,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            mode: DisplayMode::Text,
+            encoding: TextEncoding::Utf8,
+        }
+    }
+}
+
+impl ViewState {
+    fn from_form(form: &TerminalViewForm) -> Self {
+        Self {
+            mode: DisplayMode::from_id(&form.display),
+            encoding: TextEncoding::from_id(&form.encoding).unwrap_or_default(),
+        }
+    }
+
+    fn form(self) -> TerminalViewForm {
+        TerminalViewForm {
+            display: self.mode.id().to_owned(),
+            encoding: self.encoding.id().to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TerminalState {
     /// The grid size the parser was last told about.
@@ -72,6 +128,14 @@ pub struct TerminalState {
     known: Vec<ConnectionId>,
     /// The connection last drawn, so switching tabs resets the grid and input state.
     shown: Option<ConnectionId>,
+    /// Text or raw bytes per connection, and how text is decoded.
+    views: BTreeMap<ConnectionId, ViewState>,
+    /// Saved views by [`connection_key`], restored when the connection appears again.
+    saved_views: BTreeMap<String, TerminalViewForm>,
+    /// Set when a view changed, so the app writes the settings.
+    views_changed: bool,
+    /// Hex-view scroll state per connection.
+    hex: BTreeMap<ConnectionId, HexState>,
     /// Custom tab names, keyed by [`connection_key`].
     names: BTreeMap<String, String>,
     /// Set when a name was changed, so the app writes the settings.
@@ -82,10 +146,14 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-    /// Restores the custom names saved last time.
-    pub fn with_names(names: BTreeMap<String, String>) -> Self {
+    /// Restores the custom names and display choices saved last time.
+    pub fn with_saved(
+        names: BTreeMap<String, String>,
+        views: BTreeMap<String, TerminalViewForm>,
+    ) -> Self {
         Self {
             names,
+            saved_views: views,
             ..Self::default()
         }
     }
@@ -94,9 +162,19 @@ impl TerminalState {
         &self.names
     }
 
+    /// The saved display choices, keyed by [`connection_key`].
+    pub fn views(&self) -> &BTreeMap<String, TerminalViewForm> {
+        &self.saved_views
+    }
+
     /// Whether a tab was renamed since the last save; the flag is cleared.
     pub fn take_names_changed(&mut self) -> bool {
         std::mem::take(&mut self.names_changed)
+    }
+
+    /// Whether a display choice changed since the last save; the flag is cleared.
+    pub fn take_views_changed(&mut self) -> bool {
+        std::mem::take(&mut self.views_changed)
     }
 }
 
@@ -149,13 +227,16 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut TerminalState) {
         state.selected = Some(new);
     }
     state.known = ids.clone();
+    // Views of connections that went away are dropped; their saved preferences stay.
+    state.views.retain(|id, _| ids.contains(id));
+    state.hex.retain(|id, _| ids.contains(id));
     if !state.selected.is_some_and(|id| ids.contains(&id)) {
         state.selected = engine
             .active_id()
             .filter(|id| ids.contains(id))
             .or_else(|| ids.first().copied());
     }
-    terminal_tabs(ui, &connections, state);
+    terminal_tabs(ui, &connections, state, engine);
 
     let Some(connection) = state
         .selected
@@ -170,11 +251,67 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut TerminalState) {
         state.selection = None;
         state.preedit.clear();
     }
-    body(ui, engine, &connection, &connection.shared, state);
+
+    // A saved choice applies as soon as the connection appears, before its screen has content.
+    let key = connection_key(&connection.config);
+    let mut view = state.views.get(&connection.id).copied().unwrap_or_else(|| {
+        state
+            .saved_views
+            .get(&key)
+            .map_or_else(ViewState::default, ViewState::from_form)
+    });
+    if connection.shared.encoding() != view.encoding {
+        connection.shared.set_encoding(view.encoding);
+    }
+    ui.add_space(2.0);
+    if view_bar(ui, connection.id, &mut view) {
+        if connection.shared.encoding() != view.encoding {
+            connection.shared.set_encoding(view.encoding);
+        }
+        state.saved_views.insert(key, view.form());
+        state.views_changed = true;
+    }
+    state.views.insert(connection.id, view);
+
+    match view.mode {
+        DisplayMode::Text => body(ui, engine, &connection, &connection.shared, state),
+        DisplayMode::Hex => {
+            let hex = state.hex.entry(connection.id).or_default();
+            crate::panels::hex::ui(ui, &connection.shared, hex);
+        }
+    }
 }
 
-/// The row of connection tabs. Click switches the terminal, double-click renames the tab.
-fn terminal_tabs(ui: &mut Ui, connections: &[Arc<Connection>], state: &mut TerminalState) {
+/// The row above the screen: decoded text or raw bytes, and how text is decoded.
+fn view_bar(ui: &mut Ui, connection: ConnectionId, view: &mut ViewState) -> bool {
+    let before = *view;
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut view.mode, DisplayMode::Text, "文本");
+        ui.selectable_value(&mut view.mode, DisplayMode::Hex, "十六进制")
+            .on_hover_text("显示收发的原始字节");
+        ui.separator();
+        ui.label(RichText::new("编码").small().color(theme::FG_DIM))
+            .on_hover_text("文本模式下的字符编码；切换后终端画面重新开始");
+        ComboBox::from_id_salt(("terminal-encoding", connection))
+            .width(96.0)
+            .selected_text(view.encoding.label())
+            .show_ui(ui, |ui| {
+                for encoding in TextEncoding::ALL {
+                    ui.selectable_value(&mut view.encoding, encoding, encoding.label());
+                }
+            });
+    });
+    *view != before
+}
+
+/// The row of connection tabs. Click switches the terminal and the connection the send panel
+/// talks to; double-click renames the tab.
+fn terminal_tabs(
+    ui: &mut Ui,
+    connections: &[Arc<Connection>],
+    state: &mut TerminalState,
+    engine: &Engine,
+) {
     let mut start_edit: Option<(ConnectionId, String)> = None;
     let mut commit: Option<(ConnectionId, String)> = None;
 
@@ -209,6 +346,8 @@ fn terminal_tabs(ui: &mut Ui, connections: &[Arc<Connection>], state: &mut Termi
                 start_edit = Some((connection.id, name));
             } else if response.clicked() {
                 state.selected = Some(connection.id);
+                // The send panel follows the connection the person is looking at.
+                engine.set_active(connection.id);
             }
         }
     });

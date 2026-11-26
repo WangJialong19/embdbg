@@ -189,4 +189,52 @@ mod tests {
         assert!(config.subscribe.ends_with("/#"));
         assert!(!config.publish.contains('#') && !config.publish.contains('+'));
     }
+
+    /// Talks to a public broker for real; ignored so the normal test run stays offline.
+    #[tokio::test]
+    #[ignore = "needs a reachable MQTT broker; run with --ignored"]
+    async fn a_real_broker_round_trips_a_message() {
+        let topic = format!(
+            "embdbg/test/{}/{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let config = MqttConfig {
+            host: "broker.hivemq.com".to_owned(),
+            port: 1883,
+            client_id: String::new(),
+            username: None,
+            password: None,
+            subscribe: topic.clone(),
+            publish: topic,
+            qos: 1,
+        };
+        let (events, mut replies) = mpsc::unbounded_channel();
+        let link = spawn(&config, events, Clock::new());
+
+        let subscribed = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = replies.recv().await {
+                if matches!(&event, MqttEvent::Info(text) if text.starts_with("已订阅")) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(subscribed, "the broker did not confirm the subscription");
+
+        link.writes.send(b"hello embdbg".to_vec()).unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(event) = replies.recv().await {
+                if let MqttEvent::Data { bytes, .. } = event {
+                    return Some(bytes);
+                }
+            }
+            None
+        })
+        .await
+        .expect("the broker did not echo the message");
+        assert_eq!(received.as_deref(), Some(&b"hello embdbg"[..]));
+    }
 }

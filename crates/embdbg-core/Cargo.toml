@@ -11,6 +11,7 @@ parking_lot = { workspace = true }
 serialport = { workspace = true }
 realfft = { workspace = true }
 vt100 = { workspace = true }
+encoding_rs = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rmcp = { workspace = true }
@@ -21,3 +22,5 @@ futures-util = { workspace = true }
 rumqttc = { workspace = true }
 tokio-modbus = { workspace = true }
 tokio-serial = { workspace = true }
+wasmi = { workspace = true }
+toml = { workspace = true }

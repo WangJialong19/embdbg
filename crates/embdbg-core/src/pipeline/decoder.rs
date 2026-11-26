@@ -1,5 +1,7 @@
 //! Turning frames into samples or text.
 
+use crate::plugins::{self, PluginDecoder, PluginOutput};
+
 /// The tail the JustFloat and JustInt protocols share: little-endian `+inf`.
 pub const JUST_FLOAT_TAIL: [u8; 4] = [0x00, 0x00, 0x80, 0x7F];
 
@@ -14,6 +16,8 @@ pub enum DecoderSpec {
     /// A text protocol: the frame is one line of text, such as an AT command answer.
     #[default]
     Line,
+    /// A decoder from the plugins directory; the number is its slot in this run.
+    Plugin(u32),
 }
 
 impl DecoderSpec {
@@ -23,6 +27,7 @@ impl DecoderSpec {
             Self::Line => "line",
             Self::JustFloat => "justfloat",
             Self::JustInt => "justint",
+            Self::Plugin(_) => "plugin",
         }
     }
 
@@ -31,6 +36,7 @@ impl DecoderSpec {
         match self {
             Self::JustFloat | Self::JustInt => super::framing::Framing::just_float_tail(),
             Self::Line => super::framing::Framing::default(),
+            Self::Plugin(slot) => plugins::framing(slot).unwrap_or_default(),
         }
     }
 }
@@ -50,23 +56,79 @@ pub enum Decoded<'a> {
 #[derive(Debug)]
 pub struct Decoder {
     spec: DecoderSpec,
+    /// JSON parameters for a plugin; empty for the built-in decoders.
+    options: String,
     samples: Vec<f32>,
+    /// One line handed back from a plugin, kept here because [`Decoded`] only borrows.
+    line: Vec<u8>,
+    plugin: Option<PluginDecoder>,
+    plugin_error: Option<String>,
 }
 
 impl Decoder {
     pub fn new(spec: DecoderSpec) -> Self {
-        Self {
+        Self::with_options(spec, String::new())
+    }
+
+    /// A decoder with the JSON parameters a plugin connection was configured with.
+    pub fn with_options(spec: DecoderSpec, options: String) -> Self {
+        let mut decoder = Self {
             spec,
+            options,
             samples: Vec::new(),
-        }
+            line: Vec::new(),
+            plugin: None,
+            plugin_error: None,
+        };
+        decoder.ensure_plugin();
+        decoder
     }
 
     pub fn spec(&self) -> DecoderSpec {
         self.spec
     }
 
+    pub fn options(&self) -> &str {
+        &self.options
+    }
+
     pub fn set_spec(&mut self, spec: DecoderSpec) {
+        let options = self.options.clone();
+        self.set_config(spec, options);
+    }
+
+    /// Changes protocol and parameters together. A different plugin or options starts a fresh
+    /// instance, so the guest sees `set_params` once with the new values.
+    pub fn set_config(&mut self, spec: DecoderSpec, options: String) {
+        if self.spec == spec && self.options == options {
+            return;
+        }
         self.spec = spec;
+        self.options = options;
+        self.plugin = None;
+        self.plugin_error = None;
+        self.samples.clear();
+        self.line.clear();
+        self.ensure_plugin();
+    }
+
+    /// Why the plugin last refused a frame, or why it could not be instantiated.
+    pub fn plugin_error(&self) -> Option<&str> {
+        self.plugin_error.as_deref()
+    }
+
+    fn ensure_plugin(&mut self) {
+        let DecoderSpec::Plugin(slot) = self.spec else {
+            return;
+        };
+        let Some(plugin) = plugins::get(slot) else {
+            self.plugin_error = Some(format!("插件 {slot} 没有安装"));
+            return;
+        };
+        match PluginDecoder::new(&plugin, &self.options) {
+            Ok(plugin) => self.plugin = Some(plugin),
+            Err(error) => self.plugin_error = Some(error),
+        }
     }
 
     /// Decodes one frame. The result borrows from either `frame` or the decoder.
@@ -111,6 +173,31 @@ impl Decoder {
                     Decoded::Ignored
                 } else {
                     Decoded::Line(frame)
+                }
+            }
+            DecoderSpec::Plugin(_) => {
+                let Some(plugin) = self.plugin.as_mut() else {
+                    return Decoded::Ignored;
+                };
+                match plugin.decode(frame) {
+                    Ok(PluginOutput::Samples(samples)) => {
+                        self.samples = samples;
+                        self.plugin_error = None;
+                        Decoded::Samples(&self.samples)
+                    }
+                    Ok(PluginOutput::Line(line)) => {
+                        self.line = line;
+                        self.plugin_error = None;
+                        Decoded::Line(&self.line)
+                    }
+                    Ok(PluginOutput::Ignored) => {
+                        self.plugin_error = None;
+                        Decoded::Ignored
+                    }
+                    Err(error) => {
+                        self.plugin_error = Some(error);
+                        Decoded::Ignored
+                    }
                 }
             }
         }

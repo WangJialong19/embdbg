@@ -159,6 +159,16 @@ impl Default for SendMacro {
     }
 }
 
+/// How one connection's terminal was left: decoded text or raw bytes, and the text encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalViewForm {
+    /// `text` or `hex`.
+    pub display: String,
+    /// One of the ids of `TextEncoding`.
+    pub encoding: String,
+}
+
 /// Everything that survives a restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -172,6 +182,8 @@ pub struct Settings {
     pub macros: Vec<SendMacro>,
     /// Custom terminal-tab names, keyed by `kind|default name`.
     pub terminal_names: BTreeMap<String, String>,
+    /// Text/hex display and encoding, keyed by `kind|default name`.
+    pub terminal_views: BTreeMap<String, TerminalViewForm>,
 }
 
 impl Default for Settings {
@@ -182,6 +194,7 @@ impl Default for Settings {
             connections: ConnectionForm::default(),
             macros: Vec::new(),
             terminal_names: BTreeMap::new(),
+            terminal_views: BTreeMap::new(),
         }
     }
 }
@@ -281,6 +294,13 @@ mod tests {
                 ..SendMacro::default()
             }],
             terminal_names: BTreeMap::from([("串口|COM5".to_owned(), "主板".to_owned())]),
+            terminal_views: BTreeMap::from([(
+                "串口|COM5".to_owned(),
+                TerminalViewForm {
+                    display: "hex".to_owned(),
+                    encoding: "gbk".to_owned(),
+                },
+            )]),
         };
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), settings);

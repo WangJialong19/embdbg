@@ -58,10 +58,16 @@ target/release/embdbg.exe                # 空界面
 
 | 类别 | 工具 |
 |---|---|
-| 连接 | `list_serial_ports`、`open_connection`（serial / tcp-client / tcp-server / udp / websocket / mqtt / modbus-tcp / modbus-rtu / simulator）、`close_connection`、`list_connections` |
+| 连接 | `list_serial_ports`、`open_connection`（serial / tcp-client / tcp-server / udp / websocket / mqtt / modbus-tcp / modbus-rtu / simulator；可选 `decoder` 与 `decoder_options`）、`close_connection`、`list_connections` |
+| 插件 | `list_plugins`；解码器选 `plugin:<名称>` 即可用插件解析数据 |
 | 收发 | `send`、`read_lines`、`read_terminal`、`wait_for`、`send_and_wait` |
 | 分析 | `list_channels`、`read_samples`、`get_fft`、`get_histogram`、`get_stats` |
+| Modbus | `modbus_read`、`modbus_write`（写操作需在「AI」页签允许） |
+| MQTT | `mqtt_publish`（发到连接配置的发布主题；需在「AI」页签允许） |
+| 网络 | `net_dns`、`net_ping`（TCP 连通性，不是 ICMP）、`net_scan_ports` |
 | 会话 | `screenshot`（仅窗口模式：把 PNG 存到临时目录并返回路径） |
+
+写操作默认关闭：在窗口的「AI」页签勾选「允许 AI 写设备」后，`modbus_write` 与 `mqtt_publish` 才会执行；重启后恢复关闭。
 
 典型用法：让 AI 打开模拟源、读通道、算 FFT 峰值并截图；或打开串口发一条 AT 指令，`wait_for` 到 `OK` 后再读终端。
 
@@ -123,12 +129,18 @@ tools/measure.ps1 内存/CPU 采样脚本
   - 每个连接有自己的终端页签，默认以端口名（如 COM5）或地址命名；双击页签可改名，名称存入 config.toml。终端页签独立于活动连接，切换它不会改变波形等其他视图。
   - 窗口布局会记住：页签位置、活动页签、分栏比例、通道面板的开关都存在 `%LOCALAPPDATA%\embdbg\layout.json`，下次启动原样恢复。
   - 连接表单（接口、端口、波特率、数据位/校验/停止位/流控、TCP 地址）与发送宏存入 `config.toml`，重启后还在。
-- [x] **M2 MCP**：rmcp 3.11 服务、15 个工具、stdio 桥、命名管道接管窗口、无界面模式、AI 活动页签与截图工具。
+- [x] **M2 MCP**：rmcp 3.11 服务、stdio 桥、命名管道接管窗口、无界面模式、AI 活动页签与截图工具。
   - 已用脚本端到端验证两条路径：无窗口时进程内服务；有窗口时 `embdbg mcp` 接管会话，工具调用会出现在界面的「AI」页签里。
-  - 还需用真实 AI 客户端（ZCode）走一遍工具调用，并把"AI 写操作"的权限开关放到 M3 的网络工具里一起做。
+  - 还需用真实 AI 客户端（ZCode）走一遍工具调用。
 - [x] **M3 网络**：UDP、WebSocket、MQTT、Modbus TCP/RTU 主站，以及「网络工具」页（DNS、TCP 连通性、端口扫描、HTTP 请求）。
+  - MCP 侧新增 6 个工具：`modbus_read`、`modbus_write`、`mqtt_publish`、`net_dns`、`net_ping`、`net_scan_ports`。写操作默认禁止，需在「AI」页签勾选「允许 AI 写设备」，重启后恢复关闭。
+  - 用本地假从站验证了 Modbus 在线读写与权限拒绝；MQTT 用 `broker.hivemq.com` 真机收发一条 QoS 1 消息（`#[ignore]` 测试，`cargo test -- --ignored` 手动运行）。
   - 网络工具里 HTTP 目前只支持 `http://`（HTTPS 待补），连通性用 TCP 连接测量而不是 ICMP；局域网设备发现留到后续。
-- [ ] **M4 WASM 插件**。
+- [x] **M4 WASM 插件（第一版）**：wasmi 1.1 沙箱（燃料上限、8 MiB 内存上限、不允许 import）、`plugin.toml` 清单与声明式参数表单、`DecoderSpec::Plugin` 接入解码管线、`list_plugins` 工具、`embdbg plugin list|dirs`、Rust 与 C 示例、[docs/plugins.md](docs/plugins.md)。
+  - 插件目录：`%LOCALAPPDATA%\embdbg\plugins\<名字>\` 与程序旁 `plugins\<名字>\`；`--plugin-dir` 可额外指定。
+  - 已用 CSV 示例插件做端到端验证：MCP 建连选 `plugin:CSV 三通道`、发送 `1.5,2,3`、scale=2 后读到 3/4/6 三个通道；燃料耗尽与超内存增长都有测试覆盖。
+  - 安装与管理在「设置 → 解码插件」：选文件夹安装（先校验再复制）、二次确认卸载、重新扫描、打开插件目录。
+  - 待补：`plugin new/build/pack` 开发包、插件启用/禁用、每连接的参数持久化。
 - [ ] **M5 打磨发布**。
 
 ## 字体

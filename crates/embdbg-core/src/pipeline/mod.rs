@@ -15,5 +15,5 @@ pub use decoder::{Decoded, Decoder, DecoderSpec};
 pub use framing::{Framed, Framer, Framing};
 pub use session::{DataSession, SessionConfig, SessionShared};
 pub use set::ChannelSet;
-pub use terminal::Terminal;
+pub use terminal::{Terminal, TextEncoding};
 pub use traffic::{ByteLog, Direction, LineLog, TrafficStats};

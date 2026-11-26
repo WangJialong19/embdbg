@@ -1,0 +1,16 @@
+[package]
+name = "csv-channels"
+version = "0.1.0"
+edition = "2021"
+
+# Keep the example out of the program's workspace: it is a separate cdylib for wasm32.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

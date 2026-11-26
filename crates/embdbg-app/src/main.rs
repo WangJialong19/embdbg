@@ -71,6 +71,10 @@ struct Cli {
     #[arg(long)]
     tab: Option<String>,
 
+    /// 额外扫描的插件目录，可重复；优先于用户目录和程序目录
+    #[arg(long = "plugin-dir", value_name = "DIR")]
+    plugin_dirs: Vec<PathBuf>,
+
     /// 启动时直接打开一个串口（界面模式）
     #[arg(long, value_name = "PORT")]
     serial: Option<String>,
@@ -118,6 +122,19 @@ enum Command {
     Ports,
     /// 以 MCP 服务运行：有窗口时接管当前会话，否则无界面运行
     Mcp,
+    /// 插件管理
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginAction {
+    /// 列出已安装的解码插件
+    List,
+    /// 打印插件目录
+    Dirs,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -138,11 +155,35 @@ fn main() -> anyhow::Result<()> {
 fn run(cli: Cli) -> anyhow::Result<()> {
     logging::init().context("初始化日志失败")?;
     logging::capture_panics();
+    let plugins = load_plugins(&cli.plugin_dirs);
+    tracing::info!(target: "embdbg::plugins", "插件目录扫描完成：{plugins} 个插件");
 
     // Subcommands that need no window run before the graphics stack is set up at all.
     match &cli.command {
         Some(Command::Ports) => return headless::ports(),
         Some(Command::Mcp) => return mcp_host::run_stdio(),
+        Some(Command::Plugin { action }) => {
+            match action {
+                PluginAction::Dirs => {
+                    for dir in crate::app::plugin_dirs(&cli.plugin_dirs) {
+                        println!("{}", dir.display());
+                    }
+                }
+                PluginAction::List => {
+                    let plugins = embdbg_core::plugins::list();
+                    if plugins.is_empty() {
+                        println!("没有已安装的插件。插件目录：");
+                        for dir in crate::app::plugin_dirs(&cli.plugin_dirs) {
+                            println!("  {}", dir.display());
+                        }
+                    }
+                    for info in plugins {
+                        println!("{} v{} — {}", info.name, info.version, info.description);
+                    }
+                }
+            }
+            return Ok(());
+        }
         Some(Command::Serial {
             port,
             baud,
@@ -216,6 +257,12 @@ fn parse_decoder(name: &str) -> anyhow::Result<DecoderSpec> {
         "justint" | "JustInt" => Ok(DecoderSpec::JustInt),
         other => anyhow::bail!("未知协议 {other}：用 line、justfloat 或 justint"),
     }
+}
+
+/// Scans the extra directories, the user's plugin directory and the one next to the program.
+/// A broken plugin is logged and skipped; it must never keep the program from starting.
+fn load_plugins(extra: &[PathBuf]) -> usize {
+    embdbg_core::plugins::load_from_dirs(&crate::app::plugin_dirs(extra))
 }
 
 /// Parses "01 02 0A" or "0x01,0x02" into bytes.

@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use egui::{Button, ComboBox, DragValue, RichText, ScrollArea, TextEdit, Ui};
-use embdbg_core::engine::{Connection, Engine};
+use embdbg_core::engine::{Connection, ConnectionState, Engine};
 
 use crate::settings::SendMacro;
 use crate::theme::{self, FG_DIM, SPACE_1, SPACE_2};
@@ -39,6 +39,14 @@ impl LineEnding {
     }
 }
 
+/// The outcome of the last attempt, shown under the editor for a few seconds.
+#[derive(Debug)]
+struct LastSend {
+    at: Instant,
+    ok: bool,
+    text: String,
+}
+
 #[derive(Debug)]
 pub struct SendState {
     pub text: String,
@@ -47,6 +55,7 @@ pub struct SendState {
     repeat: bool,
     interval_ms: u32,
     last_sent: Option<Instant>,
+    last: Option<LastSend>,
     /// The last few payloads, newest last.
     history: Vec<String>,
     /// Saved messages, one click away.
@@ -67,6 +76,7 @@ impl Default for SendState {
             repeat: false,
             interval_ms: 1000,
             last_sent: None,
+            last: None,
             history: Vec::new(),
             macros: Vec::new(),
             macro_name: String::new(),
@@ -91,29 +101,45 @@ impl SendState {
 }
 
 /// Draws the send panel. Returns a message for the log if sending failed.
-pub fn ui(
-    ui: &mut Ui,
-    engine: &Engine,
-    connection: Option<&Connection>,
-    state: &mut SendState,
-) -> Option<String> {
-    let Some(connection) = connection else {
+pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut SendState) -> Option<String> {
+    let connections = engine.connections();
+    // The active connection follows the terminal tab the person picked; a failed one must not
+    // swallow sends, so fall back to the first connection that can actually send.
+    let usable = |connection: &&std::sync::Arc<Connection>| {
+        matches!(
+            connection.state(),
+            ConnectionState::Open | ConnectionState::Connecting
+        )
+    };
+    let target_id = engine
+        .active_id()
+        .filter(|id| connections.iter().any(|c| c.id == *id && usable(&c)))
+        .or_else(|| connections.iter().find(usable).map(|c| c.id))
+        .or_else(|| engine.active_id())
+        .or_else(|| connections.first().map(|c| c.id));
+    let Some(connection) = target_id
+        .and_then(|id| connections.iter().find(|connection| connection.id == id))
+        .cloned()
+    else {
         ui.label(
             RichText::new("先打开一个连接，并在「连接」里选中它，再从这里发送。").color(FG_DIM),
         );
         return None;
     };
+
     if matches!(
         connection.config,
         embdbg_core::engine::TransportConfig::Modbus(_)
     ) {
         ui.label(
-            RichText::new("Modbus 连接目前只读：轮询结果直接进通道，发送功能还未开放。")
+            RichText::new("所选连接是 Modbus，只读；无需发送，轮询结果直接进通道。")
+                .small()
                 .color(FG_DIM),
         );
         return None;
     }
 
+    let mut log_error = None;
     let mut send = false;
     ui.horizontal(|ui| {
         ui.selectable_value(&mut state.hex, false, "文本");
@@ -215,35 +241,81 @@ pub fn ui(
         && state
             .last_sent
             .is_none_or(|at| at.elapsed() >= Duration::from_millis(u64::from(state.interval_ms)));
+
     if let Some(entry) = send_macro {
-        return match macro_payload(&entry).and_then(|bytes| engine.send(connection.id, &bytes)) {
-            Ok(()) => None,
-            Err(error) => Some(format!("发送宏「{}」失败：{error}", entry.name)),
-        };
-    }
-    if send || due {
-        let result = payload(state).and_then(|bytes| engine.send(connection.id, &bytes));
-        match result {
-            Ok(()) => {
+        let label = format!("发送宏「{}」", entry.name);
+        match macro_payload(&entry).and_then(|bytes| {
+            let len = bytes.len();
+            engine.send(connection.id, &bytes).map(|()| len)
+        }) {
+            Ok(bytes) => {
+                state.last = Some(LastSend {
+                    at: Instant::now(),
+                    ok: true,
+                    text: format!("{label}：{bytes} 字节 → {}", target_label(&connection)),
+                });
+            }
+            Err(error) => {
+                let message = format!("{label}失败：{error}");
+                state.last = Some(LastSend {
+                    at: Instant::now(),
+                    ok: false,
+                    text: format!("{message} → {}", target_label(&connection)),
+                });
+                log_error = Some(message);
+            }
+        }
+    } else if send || due {
+        match payload(state).and_then(|bytes| {
+            let len = bytes.len();
+            engine.send(connection.id, &bytes).map(|()| len)
+        }) {
+            Ok(bytes) => {
                 state.last_sent = Some(Instant::now());
                 remember(&mut state.history, &state.text);
-                return None;
+                state.last = Some(LastSend {
+                    at: Instant::now(),
+                    ok: true,
+                    text: format!("已发送 {bytes} 字节 → {}", target_label(&connection)),
+                });
             }
-            Err(error) => return Some(format!("发送失败：{error}")),
+            Err(error) => {
+                let message = format!("发送失败：{error}");
+                state.last = Some(LastSend {
+                    at: Instant::now(),
+                    ok: false,
+                    text: format!("{message} → {}", target_label(&connection)),
+                });
+                log_error = Some(message);
+            }
         }
     }
 
+    if let Some(last) = &state.last
+        && last.at.elapsed() < Duration::from_secs(8)
+    {
+        ui.label(RichText::new(&last.text).small().color(if last.ok {
+            theme::SUCCESS
+        } else {
+            theme::DANGER
+        }));
+    }
     ui.add_space(SPACE_2);
     ui.label(
-        RichText::new(format!(
-            "发送到：{} {}",
-            connection.config.kind(),
-            connection.config.describe()
-        ))
-        .small()
-        .color(theme::FG_DIM),
+        RichText::new(format!("发送到：{}", target_label(&connection)))
+            .small()
+            .color(FG_DIM),
     );
-    None
+    log_error
+}
+
+/// The send target as one line: protocol, then the port or address.
+fn target_label(connection: &Connection) -> String {
+    format!(
+        "{} {}",
+        connection.config.kind(),
+        connection.config.describe()
+    )
 }
 
 /// The bytes the current input stands for.

@@ -4,9 +4,12 @@
 //! transport below it, and the list of open connections underneath. Only the chosen interface
 //! takes space, so the panel stays readable as more transports are added.
 
-use egui::{Button, ComboBox, DragValue, Frame, Grid, Margin, RichText, Stroke, Ui, vec2};
+use egui::{
+    Button, ComboBox, DragValue, Frame, Grid, Margin, RichText, Stroke, TextEdit, Ui, vec2,
+};
 use embdbg_core::engine::{ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::DecoderSpec;
+use embdbg_core::plugins::{self, PluginField};
 use embdbg_core::transport::{
     FlowChoice, ModbusBlock, ModbusConfig, ModbusEndpoint, MqttConfig, ParityChoice, PortInfo,
     SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig, WsConfig,
@@ -384,9 +387,32 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
                     ] {
                         ui.selectable_value(&mut spec, candidate, decoder_label(candidate));
                     }
+                    let installed = plugins::list();
+                    if !installed.is_empty() {
+                        ui.separator();
+                        for plugin in installed {
+                            let candidate = DecoderSpec::Plugin(plugin.slot);
+                            ui.selectable_value(
+                                &mut spec,
+                                candidate,
+                                format!("插件：{}", plugin.name),
+                            );
+                        }
+                    }
                 });
             if spec != connection.decoder() {
                 connection.set_decoder(spec);
+                // A plugin starts from its declared defaults; a built-in needs no options.
+                connection.set_decoder_options(default_options(spec));
+            }
+            if let DecoderSpec::Plugin(slot) = spec
+                && let Some(plugin) = plugins::get(slot)
+            {
+                plugin_fields(ui, &connection, &plugin.info.fields);
+                let error = connection.shared.plugin_error.read().clone();
+                if let Some(error) = error {
+                    ui.label(RichText::new(error).small().color(DANGER));
+                }
             }
         }
         if matches!(connection.config, TransportConfig::Simulator(_)) {
@@ -1135,11 +1161,122 @@ fn parse_flow(text: &str) -> FlowChoice {
     }
 }
 
-fn decoder_label(spec: DecoderSpec) -> &'static str {
+fn decoder_label(spec: DecoderSpec) -> String {
     match spec {
-        DecoderSpec::Line => "文本行（终端协议）",
-        DecoderSpec::JustFloat => "JustFloat（f32 数组 + 帧尾）",
-        DecoderSpec::JustInt => "JustInt（i32 数组 + 帧尾）",
+        DecoderSpec::Line => "文本行（终端协议）".to_owned(),
+        DecoderSpec::JustFloat => "JustFloat（f32 数组 + 帧尾）".to_owned(),
+        DecoderSpec::JustInt => "JustInt（i32 数组 + 帧尾）".to_owned(),
+        DecoderSpec::Plugin(slot) => plugins::get(slot).map_or_else(
+            || format!("插件 {slot}（未安装）"),
+            |plugin| format!("插件：{}", plugin.info.name),
+        ),
+    }
+}
+
+/// A plugin's declared defaults, as the JSON handed to `set_params`.
+fn default_options(spec: DecoderSpec) -> String {
+    match spec {
+        DecoderSpec::Plugin(slot) => plugins::default_params(slot),
+        _ => String::new(),
+    }
+}
+
+/// Renders the manifest's fields and writes the values back as JSON.
+fn plugin_fields(
+    ui: &mut Ui,
+    connection: &embdbg_core::engine::Connection,
+    fields: &[PluginField],
+) {
+    if fields.is_empty() {
+        return;
+    }
+    let mut values: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&connection.decoder_options()).unwrap_or_default();
+    let mut changed = false;
+
+    Grid::new(("plugin-fields", connection.id))
+        .num_columns(2)
+        .spacing([SPACE_2, SPACE_1])
+        .show(ui, |ui| {
+            for field in fields {
+                ui.label(&field.label);
+                let entry = values
+                    .entry(field.key.clone())
+                    .or_insert_with(|| field.default.clone());
+                match field.kind.as_str() {
+                    "number" => {
+                        let mut value = entry.as_f64().unwrap_or(0.0);
+                        let mut widget = DragValue::new(&mut value).speed(1.0);
+                        if field.min.is_some() || field.max.is_some() {
+                            widget = widget
+                                .range(field.min.unwrap_or(-1.0e12)..=field.max.unwrap_or(1.0e12));
+                        }
+                        if ui.add(widget).changed() {
+                            *entry = serde_json::json!(value);
+                            changed = true;
+                        }
+                    }
+                    "integer" => {
+                        let mut value = entry.as_i64().unwrap_or(0);
+                        let mut widget = DragValue::new(&mut value).speed(1.0);
+                        if field.min.is_some() || field.max.is_some() {
+                            widget = widget.range(
+                                field.min.unwrap_or(i64::MIN as f64) as i64
+                                    ..=field.max.unwrap_or(i64::MAX as f64) as i64,
+                            );
+                        }
+                        if ui.add(widget).changed() {
+                            *entry = serde_json::json!(value);
+                            changed = true;
+                        }
+                    }
+                    "bool" => {
+                        let mut value = entry.as_bool().unwrap_or(false);
+                        if ui.checkbox(&mut value, "").changed() {
+                            *entry = serde_json::json!(value);
+                            changed = true;
+                        }
+                    }
+                    "choice" => {
+                        let mut value = entry.as_str().unwrap_or_default().to_owned();
+                        let before = value.clone();
+                        ComboBox::from_id_salt(("plugin-field", connection.id, &field.key))
+                            .width(ui.available_width())
+                            .selected_text(if value.is_empty() {
+                                "选择".to_owned()
+                            } else {
+                                value.clone()
+                            })
+                            .show_ui(ui, |ui| {
+                                for option in &field.options {
+                                    ui.selectable_value(&mut value, option.clone(), option);
+                                }
+                            });
+                        if value != before {
+                            *entry = serde_json::json!(value);
+                            changed = true;
+                        }
+                    }
+                    _ => {
+                        let mut value = entry.as_str().unwrap_or_default().to_owned();
+                        if ui
+                            .add(
+                                TextEdit::singleline(&mut value)
+                                    .desired_width(ui.available_width()),
+                            )
+                            .changed()
+                        {
+                            *entry = serde_json::json!(value);
+                            changed = true;
+                        }
+                    }
+                }
+                ui.end_row();
+            }
+        });
+
+    if changed {
+        connection.set_decoder_options(serde_json::Value::Object(values).to_string());
     }
 }
 

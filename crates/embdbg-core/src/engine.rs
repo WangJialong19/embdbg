@@ -4,18 +4,18 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::api::Event;
 use crate::clock::Clock;
 use crate::pipeline::{DataSession, DecoderSpec, SessionConfig, SessionShared};
 use crate::transport::{
-    ModbusConfig, ModbusEvent, MqttConfig, MqttEvent, SIM_CHANNEL_NAMES, SIM_CHANNELS,
+    BlockKind, ModbusConfig, ModbusEvent, MqttConfig, MqttEvent, SIM_CHANNEL_NAMES, SIM_CHANNELS,
     SerialConfig, SerialEvent, Simulator, SimulatorConfig, TcpClientConfig, TcpEvent,
     TcpServerConfig, UdpConfig, UdpEvent, WsConfig, WsEvent, modbus, mqtt, serial, tcp, udp, ws,
 };
@@ -120,7 +120,11 @@ pub struct Connection {
     state: RwLock<ConnectionState>,
     /// Shared with the reading task, which checks it on every chunk.
     decoder: Arc<RwLock<DecoderSpec>>,
+    /// JSON parameters for a plugin decoder, shared with the reading task.
+    decoder_options: Arc<RwLock<String>>,
     writer: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    /// On-demand reads and writes while a Modbus polling task runs.
+    modbus_requests: Mutex<Option<mpsc::UnboundedSender<modbus::ModbusRequest>>>,
     /// How to stop the transport; taken by [`Connection::stop`].
     closer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     last_rx: RwLock<Option<Instant>>,
@@ -147,7 +151,9 @@ impl Connection {
             shared,
             state: RwLock::new(ConnectionState::Connecting),
             decoder: Arc::new(RwLock::new(decoder)),
+            decoder_options: Arc::new(RwLock::new(String::new())),
             writer: Mutex::new(None),
+            modbus_requests: Mutex::new(None),
             closer: Mutex::new(None),
             last_rx: RwLock::new(None),
             clients: RwLock::new(0),
@@ -171,6 +177,33 @@ impl Connection {
         *self.decoder.write() = spec;
     }
 
+    /// JSON parameters for a plugin decoder.
+    pub fn decoder_options(&self) -> String {
+        self.decoder_options.read().clone()
+    }
+
+    /// Changes a plugin's parameters; the running session rebuilds its instance on the next
+    /// chunk.
+    pub fn set_decoder_options(&self, options: String) {
+        *self.decoder_options.write() = options;
+    }
+
+    /// The session configuration for a new or reconfigured session.
+    fn session_config(&self, datagram: bool) -> SessionConfig {
+        let config = if datagram {
+            SessionConfig::datagram(self.decoder())
+        } else {
+            SessionConfig::stream(self.decoder())
+        };
+        config.with_options(self.decoder_options.read().clone())
+    }
+
+    /// Whether a session's decoder settings no longer match this connection's.
+    fn decoder_changed(&self, session: &DataSession) -> bool {
+        self.decoder() != session.spec()
+            || self.decoder_options.read().as_str() != session.options()
+    }
+
     pub fn clients(&self) -> usize {
         *self.clients.read()
     }
@@ -188,6 +221,14 @@ impl Connection {
 
     fn set_writer(&self, writer: mpsc::UnboundedSender<Vec<u8>>) {
         *self.writer.lock() = Some(writer);
+    }
+
+    fn set_modbus_requests(&self, requests: mpsc::UnboundedSender<modbus::ModbusRequest>) {
+        *self.modbus_requests.lock() = Some(requests);
+    }
+
+    fn modbus_requests(&self) -> Option<mpsc::UnboundedSender<modbus::ModbusRequest>> {
+        self.modbus_requests.lock().clone()
     }
 
     fn set_closer(&self, closer: Box<dyn FnOnce() + Send>) {
@@ -233,6 +274,9 @@ pub struct Engine {
     empty: Arc<SessionShared>,
     events: broadcast::Sender<Event>,
     version: Arc<AtomicU64>,
+    /// Whether AI clients may write to devices. Off by default; never persisted, so each run
+    /// starts read-only.
+    ai_writes: AtomicBool,
 }
 
 impl Engine {
@@ -249,6 +293,7 @@ impl Engine {
             empty: Arc::new(SessionShared::with_capacity(capacity)),
             events: broadcast::channel(EVENT_CAPACITY).0,
             version: Arc::new(AtomicU64::new(0)),
+            ai_writes: AtomicBool::new(false),
         }
     }
 
@@ -301,6 +346,87 @@ impl Engine {
 
     pub fn connection(&self, id: ConnectionId) -> Option<Arc<Connection>> {
         self.connections.read().get(&id).cloned()
+    }
+
+    /// Whether AI clients may write to devices (Modbus registers, MQTT publishes).
+    pub fn ai_writes_allowed(&self) -> bool {
+        self.ai_writes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ai_writes_allowed(&self, allowed: bool) {
+        self.ai_writes.store(allowed, Ordering::Relaxed);
+    }
+
+    /// Reads one Modbus block on demand, between polling cycles.
+    pub async fn modbus_read(
+        &self,
+        id: ConnectionId,
+        kind: BlockKind,
+        start: u16,
+        count: u16,
+    ) -> Result<Vec<u16>, String> {
+        if count == 0 || count > 125 {
+            return Err("数量应在 1..=125".to_owned());
+        }
+        let (reply, answer) = oneshot::channel();
+        self.modbus_request(
+            id,
+            modbus::ModbusRequest::Read {
+                kind,
+                start,
+                count,
+                reply,
+            },
+        )?;
+        answer.await.map_err(|_| "Modbus 连接已关闭".to_owned())?
+    }
+
+    /// Writes one or more registers or coils on demand.
+    pub async fn modbus_write(
+        &self,
+        id: ConnectionId,
+        kind: BlockKind,
+        start: u16,
+        values: Vec<u16>,
+    ) -> Result<(), String> {
+        if values.is_empty() {
+            return Err("没有要写入的值".to_owned());
+        }
+        let limit = if kind == BlockKind::Holding {
+            123
+        } else {
+            1968
+        };
+        if values.len() > limit {
+            return Err(format!("一次最多写 {limit} 个值"));
+        }
+        let (reply, answer) = oneshot::channel();
+        self.modbus_request(
+            id,
+            modbus::ModbusRequest::Write {
+                kind,
+                start,
+                values,
+                reply,
+            },
+        )?;
+        answer.await.map_err(|_| "Modbus 连接已关闭".to_owned())?
+    }
+
+    fn modbus_request(
+        &self,
+        id: ConnectionId,
+        request: modbus::ModbusRequest,
+    ) -> Result<(), String> {
+        let connection = self
+            .connection(id)
+            .ok_or_else(|| format!("连接 {id} 不存在"))?;
+        let sender = connection
+            .modbus_requests()
+            .ok_or_else(|| "这个连接不是 Modbus，或还没有连上".to_owned())?;
+        sender
+            .send(request)
+            .map_err(|_| "Modbus 连接已关闭".to_owned())
     }
 
     /// Opens a connection and makes it the active one. A serial port that will not open is
@@ -538,16 +664,14 @@ impl Engine {
         connection.set_closer(Box::new(move || link.stop()));
 
         let shared = Arc::clone(&connection.shared);
-        let spec = Arc::clone(&connection.decoder);
         let clock = self.clock;
         let version = Arc::clone(&self.version);
         let events = self.events.clone();
         let connection = Arc::clone(connection);
         self.rt.spawn(async move {
-            let mut session = DataSession::new(SessionConfig::stream(*spec.read()));
+            let mut session = DataSession::new(connection.session_config(false));
             run_receiver(
                 &mut session,
-                &spec,
                 &connection,
                 &shared,
                 clock,
@@ -571,13 +695,12 @@ impl Engine {
         connection.set_closer(Box::new(move || link.stop()));
 
         let shared = Arc::clone(&connection.shared);
-        let spec = Arc::clone(&connection.decoder);
         let clock = self.clock;
         let version = Arc::clone(&self.version);
         let events = self.events.clone();
         let connection = Arc::clone(connection);
         self.rt.spawn(async move {
-            let mut session = DataSession::new(SessionConfig::stream(*spec.read()));
+            let mut session = DataSession::new(connection.session_config(false));
             let mut flush = tokio::time::interval(IDLE_FLUSH_INTERVAL);
             let mut idle_watch: Option<(usize, Instant)> = None;
             loop {
@@ -595,9 +718,8 @@ impl Engine {
                     }
                     event = events_rx.recv() => match event {
                         Some(TcpEvent::Data { t, bytes }) => {
-                            let current = *spec.read();
-                            if current != session.spec() {
-                                session.reconfigure(SessionConfig::stream(current), &shared);
+                            if connection.decoder_changed(&session) {
+                                session.reconfigure(connection.session_config(false), &shared);
                             }
                             session.on_bytes(t, &bytes, &shared);
                             version.fetch_add(1, Ordering::Release);
@@ -628,21 +750,18 @@ impl Engine {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<TcpEvent>();
 
         // Each client gets its own session, so one client's partial frames cannot mix with another's.
-        let spec = Arc::clone(&connection.decoder);
         let shared_for_sinks = Arc::clone(&connection.shared);
         let clock = self.clock;
         let version_for_sinks = Arc::clone(&self.version);
         let connection_for_sinks = Arc::clone(connection);
         let make_sink: tcp::ClientSinkFactory = Box::new(move |_client| {
-            let mut session = DataSession::new(SessionConfig::stream(*spec.read()));
-            let spec = Arc::clone(&spec);
+            let mut session = DataSession::new(connection_for_sinks.session_config(false));
             let shared = Arc::clone(&shared_for_sinks);
             let version = Arc::clone(&version_for_sinks);
             let connection = Arc::clone(&connection_for_sinks);
             Box::new(move |bytes: &[u8]| {
-                let current = *spec.read();
-                if current != session.spec() {
-                    session.reconfigure(SessionConfig::stream(current), &shared);
+                if connection.decoder_changed(&session) {
+                    session.reconfigure(connection.session_config(false), &shared);
                 }
                 session.on_bytes(clock.now(), bytes, &shared);
                 version.fetch_add(1, Ordering::Release);
@@ -684,13 +803,12 @@ impl Engine {
         connection.set_closer(Box::new(move || link.stop()));
 
         let shared = Arc::clone(&connection.shared);
-        let spec = Arc::clone(&connection.decoder);
         let clock = self.clock;
         let version = Arc::clone(&self.version);
         let events = self.events.clone();
         let connection = Arc::clone(connection);
         self.rt.spawn(async move {
-            let mut session = DataSession::new(SessionConfig::stream(*spec.read()));
+            let mut session = DataSession::new(connection.session_config(false));
             let mut flush = tokio::time::interval(IDLE_FLUSH_INTERVAL);
             let mut idle_watch: Option<(usize, Instant)> = None;
             loop {
@@ -708,9 +826,8 @@ impl Engine {
                     }
                     event = events_rx.recv() => match event {
                         Some(WsEvent::Data { t, bytes }) => {
-                            let current = *spec.read();
-                            if current != session.spec() {
-                                session.reconfigure(SessionConfig::stream(current), &shared);
+                            if connection.decoder_changed(&session) {
+                                session.reconfigure(connection.session_config(false), &shared);
                             }
                             session.on_bytes(t, &bytes, &shared);
                             version.fetch_add(1, Ordering::Release);
@@ -751,6 +868,7 @@ impl Engine {
         let names = config.channel_names();
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ModbusEvent>();
         let mut link = modbus::spawn(&config, events_tx, self.clock);
+        connection.set_modbus_requests(link.requests.clone());
         connection.set_closer(Box::new(move || link.stop()));
 
         let shared = Arc::clone(&connection.shared);
@@ -797,19 +915,17 @@ impl Engine {
         connection.set_closer(Box::new(move || link.stop()));
 
         let shared = Arc::clone(&connection.shared);
-        let spec = Arc::clone(&connection.decoder);
         let version = Arc::clone(&self.version);
         let events = self.events.clone();
         let connection = Arc::clone(connection);
         self.rt.spawn(async move {
             // One publish payload is one frame: MQTT keeps its boundaries like a datagram.
-            let mut session = DataSession::new(SessionConfig::datagram(*spec.read()));
+            let mut session = DataSession::new(connection.session_config(true));
             while let Some(event) = events_rx.recv().await {
                 match event {
                     MqttEvent::Data { t, bytes } => {
-                        let current = *spec.read();
-                        if current != session.spec() {
-                            session.reconfigure(SessionConfig::datagram(current), &shared);
+                        if connection.decoder_changed(&session) {
+                            session.reconfigure(connection.session_config(true), &shared);
                         }
                         session.on_bytes(t, &bytes, &shared);
                         version.fetch_add(1, Ordering::Release);
@@ -838,18 +954,16 @@ impl Engine {
         connection.set_closer(Box::new(move || link.stop()));
 
         let shared = Arc::clone(&connection.shared);
-        let spec = Arc::clone(&connection.decoder);
         let version = Arc::clone(&self.version);
         let events = self.events.clone();
         let connection = Arc::clone(connection);
         self.rt.spawn(async move {
-            let mut session = DataSession::new(SessionConfig::datagram(*spec.read()));
+            let mut session = DataSession::new(connection.session_config(true));
             while let Some(event) = events_rx.recv().await {
                 match event {
                     UdpEvent::Data { t, bytes } => {
-                        let current = *spec.read();
-                        if current != session.spec() {
-                            session.reconfigure(SessionConfig::datagram(current), &shared);
+                        if connection.decoder_changed(&session) {
+                            session.reconfigure(connection.session_config(true), &shared);
                         }
                         session.on_bytes(t, &bytes, &shared);
                         version.fetch_add(1, Ordering::Release);
@@ -875,7 +989,6 @@ impl Engine {
 #[allow(clippy::too_many_arguments)]
 async fn run_receiver<E>(
     session: &mut DataSession,
-    spec: &RwLock<DecoderSpec>,
     connection: &Connection,
     shared: &SessionShared,
     clock: Clock,
@@ -905,9 +1018,8 @@ async fn run_receiver<E>(
                 let Some(event) = event else { break };
                 match classify(event) {
                     Ok((t, bytes)) => {
-                        let current = *spec.read();
-                        if current != session.spec() {
-                            session.reconfigure(SessionConfig::stream(current), shared);
+                        if connection.decoder_changed(session) {
+                            session.reconfigure(connection.session_config(false), shared);
                         }
                         session.on_bytes(t, &bytes, shared);
                         version.fetch_add(1, Ordering::Release);

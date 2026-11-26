@@ -1,4 +1,6 @@
 /target
+# Example plugins build with their own target directory.
+examples/plugins/*/target/
 **/*.rs.bk
 *.pdb
 /.zcode

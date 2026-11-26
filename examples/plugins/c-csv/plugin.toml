@@ -1,0 +1,7 @@
+# Build decoder.c first (see the comment at the top of decoder.c).
+api = 1
+name = "C CSV 示例"
+version = "0.1.0"
+description = "用 C 写的 CSV 解码插件，演示无 libc 的 ABI 实现"
+framing = "line"
+max_frame = 4096

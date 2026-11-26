@@ -19,10 +19,10 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::analysis::{FftAnalyzer, Window, histogram};
 use crate::engine::{Connection, ConnectionState, Engine, TransportConfig};
-use crate::pipeline::Direction;
+use crate::pipeline::{DecoderSpec, Direction};
 use crate::transport::{
-    ModbusBlock, ModbusConfig, ModbusEndpoint, MqttConfig, SerialConfig, SimulatorConfig,
-    TcpClientConfig, TcpServerConfig, UdpConfig, WsConfig, list_ports,
+    BlockKind, ModbusBlock, ModbusConfig, ModbusEndpoint, MqttConfig, SerialConfig,
+    SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig, WsConfig, list_ports,
 };
 
 /// How many tool calls the activity feed keeps for the window.
@@ -177,9 +177,40 @@ impl McpService {
     }
 
     #[tool(
+        name = "list_plugins",
+        description = "List installed decoder plugins, their versions and declared parameters."
+    )]
+    fn list_plugins(&self) -> Result<Json<PluginsOut>, String> {
+        let result = Ok(Json(PluginsOut {
+            plugins: crate::plugins::list()
+                .into_iter()
+                .map(|info| PluginOut {
+                    name: info.name,
+                    version: info.version,
+                    description: info.description,
+                    fields: info
+                        .fields
+                        .into_iter()
+                        .map(|field| PluginFieldOut {
+                            key: field.key,
+                            label: field.label,
+                            kind: field.kind,
+                            default: field.default,
+                            options: field.options,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }));
+        self.record("list_plugins", &result);
+        result
+    }
+
+    #[tool(
         name = "open_connection",
-        description = "Open a serial port, a TCP client, a TCP server or the built-in simulator. \
-                      Returns the connection id used by every other tool."
+        description = "Open a connection: serial, tcp-client, tcp-server, udp, websocket, mqtt, \
+                      modbus-tcp, modbus-rtu or the built-in simulator. Returns the connection \
+                      id used by every other tool."
     )]
     fn open_connection(
         &self,
@@ -369,6 +400,86 @@ impl McpService {
         self.record("get_stats", &result);
         result
     }
+
+    #[tool(
+        name = "modbus_read",
+        description = "Read Modbus holding registers, input registers, coils or discrete inputs \
+                       from an open Modbus connection, without waiting for the polling cycle."
+    )]
+    async fn modbus_read(
+        &self,
+        Parameters(params): Parameters<ModbusReadParams>,
+    ) -> Result<Json<ModbusValuesOut>, String> {
+        let result = self.modbus_read_inner(params).await;
+        self.record("modbus_read", &result);
+        result
+    }
+
+    #[tool(
+        name = "modbus_write",
+        description = "Write one or more Modbus holding registers or coils. Requires the user \
+                       to allow AI writes in the window; otherwise it fails."
+    )]
+    async fn modbus_write(
+        &self,
+        Parameters(params): Parameters<ModbusWriteParams>,
+    ) -> Result<Json<ModbusWrittenOut>, String> {
+        let result = self.modbus_write_inner(params).await;
+        self.record("modbus_write", &result);
+        result
+    }
+
+    #[tool(
+        name = "mqtt_publish",
+        description = "Publish a payload on an open MQTT connection's publish topic. Requires \
+                       the user to allow AI writes in the window."
+    )]
+    fn mqtt_publish(
+        &self,
+        Parameters(params): Parameters<MqttPublishParams>,
+    ) -> Result<Json<MqttPublishedOut>, String> {
+        let result = self.mqtt_publish_inner(params);
+        self.record("mqtt_publish", &result);
+        result
+    }
+
+    #[tool(name = "net_dns", description = "Resolve a host name to IP addresses.")]
+    async fn net_dns(
+        &self,
+        Parameters(params): Parameters<NetDnsParams>,
+    ) -> Result<Json<DnsOut>, String> {
+        let result = self.net_dns_inner(params).await;
+        self.record("net_dns", &result);
+        result
+    }
+
+    #[tool(
+        name = "net_ping",
+        description = "Check whether a TCP port answers, and how long the connection takes. \
+                       This is TCP reachability, not ICMP echo."
+    )]
+    async fn net_ping(
+        &self,
+        Parameters(params): Parameters<NetPingParams>,
+    ) -> Result<Json<PingOut>, String> {
+        let result = self.net_ping_inner(params).await;
+        self.record("net_ping", &result);
+        result
+    }
+
+    #[tool(
+        name = "net_scan_ports",
+        description = "Scan a TCP port range on a host and list the ports that accept \
+                       connections. At most 10001 ports per call."
+    )]
+    async fn net_scan_ports(
+        &self,
+        Parameters(params): Parameters<NetScanParams>,
+    ) -> Result<Json<ScanOut>, String> {
+        let result = self.net_scan_inner(params).await;
+        self.record("net_scan_ports", &result);
+        result
+    }
 }
 
 #[tool_handler]
@@ -377,8 +488,10 @@ impl ServerHandler for McpService {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("embdbg", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Tools for debugging embedded hardware: open serial or TCP connections, send \
-                 and wait for text, and read waveforms, spectra and histograms.",
+                "Tools for debugging embedded hardware: serial, TCP, UDP, WebSocket, MQTT and \
+                 Modbus connections; sending and waiting for text; waveforms, spectra and \
+                 histograms; decoder plugins; Modbus register access; and small network checks. \
+                 Writes to devices require the user to enable AI writes in the window.",
             )
     }
 }
@@ -493,6 +606,25 @@ impl McpService {
             .engine
             .connection(id)
             .ok_or_else(|| "连接刚打开却查不到".to_owned())?;
+        if let Some(text) = params
+            .decoder
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            let spec = decoder_spec(text)?;
+            connection.set_decoder(spec);
+            let options = params
+                .decoder_options
+                .clone()
+                .unwrap_or_else(|| match spec {
+                    DecoderSpec::Plugin(slot) => crate::plugins::default_params(slot),
+                    _ => String::new(),
+                });
+            connection.set_decoder_options(options);
+        } else if let Some(options) = params.decoder_options.clone() {
+            connection.set_decoder_options(options);
+        }
         Ok(Json(OpenedOut {
             id,
             kind: connection.config.kind().to_owned(),
@@ -727,6 +859,155 @@ impl McpService {
             sample_rate,
         }))
     }
+
+    async fn modbus_read_inner(
+        &self,
+        params: ModbusReadParams,
+    ) -> Result<Json<ModbusValuesOut>, String> {
+        let connection = self.connection(params.connection_id)?;
+        let kind = register_kind(params.kind.as_deref())?;
+        let values = self
+            .engine
+            .modbus_read(connection.id, kind, params.start, params.count.unwrap_or(1))
+            .await?;
+        Ok(Json(ModbusValuesOut {
+            connection_id: connection.id,
+            kind: kind.id().to_owned(),
+            start: params.start,
+            values,
+        }))
+    }
+
+    async fn modbus_write_inner(
+        &self,
+        params: ModbusWriteParams,
+    ) -> Result<Json<ModbusWrittenOut>, String> {
+        self.require_write_permission()?;
+        let connection = self.connection(params.connection_id)?;
+        let kind = register_kind(params.kind.as_deref())?;
+        let written = params.values.len();
+        self.engine
+            .modbus_write(connection.id, kind, params.start, params.values)
+            .await?;
+        Ok(Json(ModbusWrittenOut {
+            connection_id: connection.id,
+            kind: kind.id().to_owned(),
+            start: params.start,
+            written,
+        }))
+    }
+
+    fn mqtt_publish_inner(
+        &self,
+        params: MqttPublishParams,
+    ) -> Result<Json<MqttPublishedOut>, String> {
+        self.require_write_permission()?;
+        let connection = self.connection(params.connection_id)?;
+        let TransportConfig::Mqtt(config) = &connection.config else {
+            return Err("这个连接不是 MQTT".to_owned());
+        };
+        let payload = build_payload(params.text.as_deref(), params.hex.as_deref(), None)?;
+        self.engine.send(connection.id, &payload)?;
+        Ok(Json(MqttPublishedOut {
+            connection_id: connection.id,
+            topic: config.publish.clone(),
+            bytes_sent: payload.len(),
+        }))
+    }
+
+    /// Writing to a device is the one thing an AI may not do without the user saying so.
+    fn require_write_permission(&self) -> Result<(), String> {
+        if self.engine.ai_writes_allowed() {
+            Ok(())
+        } else {
+            Err("AI 写操作已关闭：请在窗口的「AI」页签勾选「允许 AI 写设备」后重试".to_owned())
+        }
+    }
+
+    async fn net_dns_inner(&self, params: NetDnsParams) -> Result<Json<DnsOut>, String> {
+        let addresses = tokio::net::lookup_host((params.host.as_str(), 0))
+            .await
+            .map_err(|error| format!("解析 {} 失败：{error}", params.host))?;
+        let mut unique: Vec<String> = Vec::new();
+        for address in addresses {
+            let ip = address.ip().to_string();
+            if !unique.contains(&ip) {
+                unique.push(ip);
+            }
+        }
+        Ok(Json(DnsOut {
+            host: params.host,
+            addresses: unique,
+        }))
+    }
+
+    async fn net_ping_inner(&self, params: NetPingParams) -> Result<Json<PingOut>, String> {
+        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(1000).clamp(100, 10_000));
+        let started = Instant::now();
+        let attempt = tokio::time::timeout(
+            timeout,
+            tokio::net::TcpStream::connect((params.host.as_str(), params.port)),
+        )
+        .await;
+        let (connected, error) = match attempt {
+            Ok(Ok(_stream)) => (true, None),
+            Ok(Err(error)) => (false, Some(error.to_string())),
+            Err(_) => (false, Some(format!("超时（{} ms）", timeout.as_millis()))),
+        };
+        Ok(Json(PingOut {
+            host: params.host,
+            port: params.port,
+            connected,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error,
+        }))
+    }
+
+    async fn net_scan_inner(&self, params: NetScanParams) -> Result<Json<ScanOut>, String> {
+        let start = params.start.unwrap_or(1).max(1);
+        let end = params.end.unwrap_or(1024).max(start);
+        if u32::from(end) - u32::from(start) > 10_000 {
+            return Err("一次最多扫描 10001 个端口".to_owned());
+        }
+        let timeout = Duration::from_millis(params.timeout_ms.unwrap_or(600).clamp(50, 10_000));
+        let concurrency = params.concurrency.unwrap_or(64).clamp(1, 256);
+        let started = Instant::now();
+        let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut tasks = tokio::task::JoinSet::new();
+        for port in start..=end {
+            let permit = Arc::clone(&permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| "扫描已取消".to_owned())?;
+            let host = params.host.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                let open = tokio::time::timeout(
+                    timeout,
+                    tokio::net::TcpStream::connect((host.as_str(), port)),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok());
+                (port, open)
+            });
+        }
+        let mut open_ports = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok((port, true)) = joined {
+                open_ports.push(OpenPortOut {
+                    port,
+                    service: service_name(port).to_owned(),
+                });
+            }
+        }
+        open_ports.sort_by_key(|entry| entry.port);
+        Ok(Json(ScanOut {
+            host: params.host,
+            scanned: usize::from(end - start) + 1,
+            open_ports,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        }))
+    }
 }
 
 /// Which transport to open.
@@ -785,6 +1066,10 @@ struct OpenParams {
     /// Modbus polling table: each line is `kind start count [name]`, for example
     /// `holding 0 8 电压` or `input 0 4`.
     blocks: Option<Vec<String>>,
+    /// Decoder: line, justfloat, justint, or `plugin:<name>` from `list_plugins`.
+    decoder: Option<String>,
+    /// JSON parameters for a plugin decoder; the manifest defaults when omitted.
+    decoder_options: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
@@ -867,6 +1152,28 @@ struct PortOut {
 #[derive(Debug, Serialize, JsonSchema)]
 struct PortsOut {
     ports: Vec<PortOut>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct PluginFieldOut {
+    key: String,
+    label: String,
+    kind: String,
+    default: serde_json::Value,
+    options: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct PluginOut {
+    name: String,
+    version: String,
+    description: String,
+    fields: Vec<PluginFieldOut>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct PluginsOut {
+    plugins: Vec<PluginOut>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1003,6 +1310,118 @@ struct StatsOut {
     sample_rate: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct ModbusReadParams {
+    connection_id: Option<u64>,
+    /// holding, input, coil or discrete; default holding.
+    kind: Option<String>,
+    /// First address.
+    start: u16,
+    /// How many values to read, 1 to 125; default 1.
+    count: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct ModbusWriteParams {
+    connection_id: Option<u64>,
+    /// holding or coil; input and discrete areas are read-only.
+    kind: Option<String>,
+    /// First address.
+    start: u16,
+    /// Register words, or 0/1 for each coil.
+    values: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct MqttPublishParams {
+    connection_id: Option<u64>,
+    /// Text payload, encoded as UTF-8.
+    text: Option<String>,
+    /// Hex payload such as "01 02 0A"; takes precedence over text.
+    hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct NetDnsParams {
+    host: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct NetPingParams {
+    host: String,
+    port: u16,
+    /// How long to wait for the connection, in milliseconds; default 1000.
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct NetScanParams {
+    host: String,
+    /// First port, default 1.
+    start: Option<u16>,
+    /// Last port, default 1024.
+    end: Option<u16>,
+    /// Per-port timeout in milliseconds; default 600.
+    timeout_ms: Option<u64>,
+    /// Ports attempted at once, 1 to 256; default 64.
+    concurrency: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ModbusValuesOut {
+    connection_id: u64,
+    kind: String,
+    start: u16,
+    /// Register words; coils and discrete inputs come back as 0 or 1.
+    values: Vec<u16>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ModbusWrittenOut {
+    connection_id: u64,
+    kind: String,
+    start: u16,
+    written: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct MqttPublishedOut {
+    connection_id: u64,
+    topic: String,
+    bytes_sent: usize,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct DnsOut {
+    host: String,
+    addresses: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct PingOut {
+    host: String,
+    port: u16,
+    connected: bool,
+    elapsed_ms: u64,
+    /// Why the connection failed, when it did.
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct OpenPortOut {
+    port: u16,
+    /// Common service name for well-known ports, otherwise empty.
+    service: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ScanOut {
+    host: String,
+    scanned: usize,
+    open_ports: Vec<OpenPortOut>,
+    elapsed_ms: u64,
+}
+
 fn state_text(state: &ConnectionState) -> String {
     match state {
         ConnectionState::Connecting => "connecting".to_owned(),
@@ -1050,6 +1469,44 @@ fn join_lines(lines: &[LineOut]) -> String {
 }
 
 /// The bytes a send stands for. Hex wins over text; text may carry a line ending.
+fn register_kind(text: Option<&str>) -> Result<BlockKind, String> {
+    match text {
+        None => Ok(BlockKind::Holding),
+        Some(text) => BlockKind::parse(text)
+            .ok_or_else(|| format!("未知区域 {text}：用 holding、input、coil 或 discrete")),
+    }
+}
+
+/// `line`, `justfloat`, `justint`, or a plugin by name (with or without the `plugin:` prefix).
+fn decoder_spec(text: &str) -> Result<DecoderSpec, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "line" | "文本行" => Ok(DecoderSpec::Line),
+        "justfloat" => Ok(DecoderSpec::JustFloat),
+        "justint" => Ok(DecoderSpec::JustInt),
+        _ => {
+            let name = text.strip_prefix("plugin:").unwrap_or(text);
+            let slot = crate::plugins::slot_of(name).ok_or_else(|| {
+                format!("插件「{name}」没有安装；用 list_plugins 查看已安装的插件")
+            })?;
+            Ok(DecoderSpec::Plugin(slot))
+        }
+    }
+}
+
+fn service_name(port: u16) -> &'static str {
+    match port {
+        22 => "ssh",
+        23 => "telnet",
+        53 => "dns",
+        80 => "http",
+        443 => "https",
+        502 => "modbus",
+        1883 => "mqtt",
+        8080 => "http-alt",
+        _ => "",
+    }
+}
+
 fn build_payload(
     text: Option<&str>,
     hex: Option<&str>,
@@ -1296,9 +1753,12 @@ mod tests {
     async fn modbus_blocks_flow_through_the_tools() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // A minimal Modbus TCP slave: every holding-register read returns start + i.
+        // A minimal Modbus TCP slave: every holding-register read returns start + i, and a
+        // single-register write is recorded and echoed.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let written = Arc::new(std::sync::Mutex::new(Vec::<u16>::new()));
+        let recorder = Arc::clone(&written);
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             loop {
@@ -1311,10 +1771,19 @@ mod tests {
                 let function = request[7];
                 let start = u16::from_be_bytes([request[8], request[9]]);
                 let count = u16::from_be_bytes([request[10], request[11]]);
-                let mut pdu = vec![function, (count * 2) as u8];
-                for offset in 0..count {
-                    pdu.extend_from_slice(&(start + offset).to_be_bytes());
-                }
+                let pdu = if function == 6 {
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push(u16::from_be_bytes([request[10], request[11]]));
+                    request[7..12].to_vec()
+                } else {
+                    let mut pdu = vec![function, (count * 2) as u8];
+                    for offset in 0..count {
+                        pdu.extend_from_slice(&(start + offset).to_be_bytes());
+                    }
+                    pdu
+                };
                 let mut header = Vec::new();
                 header.extend_from_slice(&transaction.to_be_bytes());
                 header.extend_from_slice(&0u16.to_be_bytes());
@@ -1373,6 +1842,76 @@ mod tests {
             "{:?}",
             samples.values
         );
+
+        // On-demand access shares the polling task's connection. Writes need the user's go-ahead.
+        let write = ModbusWriteParams {
+            connection_id: Some(opened.id),
+            kind: Some("holding".to_owned()),
+            start: 2,
+            values: vec![1234],
+        };
+        assert!(
+            service.modbus_write_inner(write.clone()).await.is_err(),
+            "writes must be refused while the permission is off"
+        );
+        engine.set_ai_writes_allowed(true);
+        service.modbus_write_inner(write).await.unwrap();
+        assert_eq!(*written.lock().unwrap().last().unwrap(), 1234);
+
+        let read = service
+            .modbus_read_inner(ModbusReadParams {
+                connection_id: Some(opened.id),
+                kind: Some("holding".to_owned()),
+                start: 5,
+                count: Some(3),
+            })
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(read.values, [5, 6, 7]);
+    }
+
+    #[tokio::test]
+    async fn network_tools_see_a_local_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let engine = Arc::new(Engine::new(tokio::runtime::Handle::current(), 1024));
+        let service = McpService::new(engine);
+
+        let ping = service
+            .net_ping_inner(NetPingParams {
+                host: "127.0.0.1".to_owned(),
+                port,
+                timeout_ms: Some(1000),
+            })
+            .await
+            .unwrap()
+            .0;
+        assert!(ping.connected, "{:?}", ping.error);
+
+        let scan = service
+            .net_scan_inner(NetScanParams {
+                host: "127.0.0.1".to_owned(),
+                start: Some(port),
+                end: Some(port),
+                timeout_ms: Some(1000),
+                concurrency: Some(4),
+            })
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(scan.scanned, 1);
+        assert_eq!(scan.open_ports.len(), 1);
+        assert_eq!(scan.open_ports[0].port, port);
+
+        let dns = service
+            .net_dns_inner(NetDnsParams {
+                host: "localhost".to_owned(),
+            })
+            .await
+            .unwrap()
+            .0;
+        assert!(!dns.addresses.is_empty());
     }
 
     #[test]

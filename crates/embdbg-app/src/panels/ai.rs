@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 
 use egui::{RichText, ScrollArea, Ui};
+use embdbg_core::engine::Engine;
 use embdbg_core::mcp::Activity;
 
 use crate::theme;
@@ -24,7 +25,7 @@ impl AiState {
     }
 }
 
-pub fn ui(ui: &mut Ui, state: &mut AiState) {
+pub fn ui(ui: &mut Ui, state: &mut AiState, engine: &Engine) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("AI 活动").strong());
         ui.label(
@@ -32,6 +33,26 @@ pub fn ui(ui: &mut Ui, state: &mut AiState) {
                 .small()
                 .color(theme::FG_DIM),
         );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut allowed = engine.ai_writes_allowed();
+            let color = if allowed {
+                theme::WARNING
+            } else {
+                theme::FG_DIM
+            };
+            if ui
+                .checkbox(
+                    &mut allowed,
+                    RichText::new("允许 AI 写设备").small().color(color),
+                )
+                .on_hover_text(
+                    "允许 AI 调用 modbus_write 和 mqtt_publish。默认关闭，重启后恢复关闭。",
+                )
+                .changed()
+            {
+                engine.set_ai_writes_allowed(allowed);
+            }
+        });
     });
     if state.entries.is_empty() {
         ui.label(

@@ -15,7 +15,7 @@ use crate::app::{Tab, default_dock};
 use crate::logging;
 
 /// Bumped when the meaning of a saved layout changes; older files then fall back to the default.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// The parts of the window that are restored: the dock and whether the connection sidebar is
 /// shown. The sidebar is a plain panel rather than a dock tab, so its visibility is saved here.
@@ -35,13 +35,12 @@ impl Default for Layout {
 }
 
 /// Every tab except the two closable side panels: those may be missing from a saved layout.
-const REQUIRED: [Tab; 10] = [
+const REQUIRED: [Tab; 9] = [
     Tab::Waveform,
     Tab::Xy,
     Tab::Spectrum,
     Tab::Histogram,
     Tab::Terminal,
-    Tab::Hex,
     Tab::Ai,
     Tab::Tools,
     Tab::Send,

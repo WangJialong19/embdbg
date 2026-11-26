@@ -1,0 +1,16 @@
+# The plugin ABI this was written for.
+api = 1
+name = "CSV 三通道"
+version = "0.1.0"
+description = "把逗号分隔的一行数字变成通道；每行三个数就是三通道"
+# Lines end at '\n'; use "tail" with a hex tail or "datagram" for binary protocols.
+framing = "line"
+max_frame = 4096
+
+[[fields]]
+key = "scale"
+label = "缩放倍数"
+kind = "number"
+default = 1.0
+min = 0.0
+max = 1000.0
