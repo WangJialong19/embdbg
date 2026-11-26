@@ -4,6 +4,7 @@ pub mod serial;
 pub mod sim;
 pub mod tcp;
 pub mod udp;
+pub mod ws;
 
 pub use serial::{
     FlowChoice, ParityChoice, PortInfo, SerialConfig, SerialEvent, SerialLink, list_ports,
@@ -14,3 +15,4 @@ pub use tcp::{
     spawn_client, spawn_server,
 };
 pub use udp::{UdpConfig, UdpEvent, UdpLink};
+pub use ws::{WsConfig, WsEvent, WsLink};

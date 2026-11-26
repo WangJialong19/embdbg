@@ -21,7 +21,8 @@ use crate::analysis::{FftAnalyzer, Window, histogram};
 use crate::engine::{Connection, ConnectionState, Engine, TransportConfig};
 use crate::pipeline::Direction;
 use crate::transport::{
-    SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig, list_ports,
+    SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig, WsConfig,
+    list_ports,
 };
 
 /// How many tool calls the activity feed keeps for the window.
@@ -425,6 +426,15 @@ impl McpService {
                     target: params.target.filter(|target| !target.trim().is_empty()),
                 })
             }
+            TransportKind::WebSocket => {
+                let url = params
+                    .url
+                    .filter(|url| !url.trim().is_empty())
+                    .ok_or_else(|| "WebSocket 需要 url，例如 ws://127.0.0.1:8080/".to_owned())?;
+                TransportConfig::WebSocket(WsConfig {
+                    url: url.trim().to_owned(),
+                })
+            }
             TransportKind::Simulator => TransportConfig::Simulator(SimulatorConfig::default()),
         };
         let id = self.engine.open(config)?;
@@ -677,13 +687,15 @@ enum TransportKind {
     TcpClient,
     TcpServer,
     Udp,
+    #[serde(rename = "websocket", alias = "web-socket")]
+    WebSocket,
     /// The built-in 8-channel signal generator, for testing the tools without hardware.
     Simulator,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 struct OpenParams {
-    /// One of serial, tcp-client, tcp-server or simulator.
+    /// One of serial, tcp-client, tcp-server, udp, websocket or simulator.
     transport: TransportKind,
     /// Serial port name, such as COM5 or /dev/ttyUSB0.
     port: Option<String>,
@@ -699,6 +711,8 @@ struct OpenParams {
     udp_port: Option<u16>,
     /// Where UDP sends go, as `host:port`; empty replies to the last sender.
     target: Option<String>,
+    /// WebSocket address, `ws://` or `wss://`.
+    url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
@@ -1127,6 +1141,83 @@ mod tests {
             build_payload(None, Some("01 02"), None).unwrap(),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn the_websocket_transport_name_has_no_dash() {
+        let params: OpenParams = serde_json::from_str(r#"{"transport":"websocket"}"#).unwrap();
+        assert!(matches!(params.transport, TransportKind::WebSocket));
+    }
+
+    #[tokio::test]
+    async fn websocket_flows_through_the_tools() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let reply = format!("echo:{text}");
+                    let _ = socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(reply.into()))
+                        .await;
+                }
+            }
+        });
+
+        let engine = Arc::new(Engine::new(tokio::runtime::Handle::current(), 1 << 16));
+        let service = McpService::new(Arc::clone(&engine));
+        let opened = service
+            .open_inner(OpenParams {
+                transport: TransportKind::WebSocket,
+                url: Some(format!("ws://{addr}/")),
+                ..OpenParams::default()
+            })
+            .unwrap()
+            .0;
+        assert_eq!(opened.kind, "WebSocket");
+
+        let mut open = false;
+        for _ in 0..100 {
+            if engine
+                .connection(opened.id)
+                .is_some_and(|connection| connection.state().is_open())
+            {
+                open = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(open, "the websocket should connect");
+
+        service
+            .send_inner(SendParams {
+                connection_id: Some(opened.id),
+                text: Some("hello".to_owned()),
+                ..SendParams::default()
+            })
+            .unwrap();
+
+        let mut heard = None;
+        for _ in 0..50 {
+            let lines = service
+                .read_lines_inner(ReadLinesParams {
+                    connection_id: Some(opened.id),
+                    limit: Some(5),
+                })
+                .unwrap()
+                .0;
+            // The sent text is logged as a tx line too; wait for the echoed reply.
+            if let Some(line) = lines.lines.iter().find(|line| line.text == "echo:hello") {
+                heard = Some(line.text.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(heard.as_deref(), Some("echo:hello"));
     }
 
     #[test]

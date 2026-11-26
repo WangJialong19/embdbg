@@ -16,7 +16,8 @@ use crate::clock::Clock;
 use crate::pipeline::{DataSession, DecoderSpec, SessionConfig, SessionShared};
 use crate::transport::{
     SIM_CHANNEL_NAMES, SIM_CHANNELS, SerialConfig, SerialEvent, Simulator, SimulatorConfig,
-    TcpClientConfig, TcpEvent, TcpServerConfig, UdpConfig, UdpEvent, serial, tcp, udp,
+    TcpClientConfig, TcpEvent, TcpServerConfig, UdpConfig, UdpEvent, WsConfig, WsEvent, serial,
+    tcp, udp, ws,
 };
 
 /// Identifies a connection for as long as the program runs.
@@ -42,6 +43,7 @@ pub enum TransportConfig {
     TcpClient(TcpClientConfig),
     TcpServer(TcpServerConfig),
     Udp(UdpConfig),
+    WebSocket(WsConfig),
 }
 
 impl TransportConfig {
@@ -53,6 +55,7 @@ impl TransportConfig {
             Self::TcpClient(_) => "TCP 客户端",
             Self::TcpServer(_) => "TCP 服务器",
             Self::Udp(_) => "UDP",
+            Self::WebSocket(_) => "WebSocket",
         }
     }
 
@@ -66,6 +69,7 @@ impl TransportConfig {
             Self::TcpClient(config) => format!("{}:{}", config.host, config.port),
             Self::TcpServer(config) => format!("{}:{}", config.bind, config.port),
             Self::Udp(config) => config.describe(),
+            Self::WebSocket(config) => config.describe(),
         }
     }
 
@@ -321,6 +325,10 @@ impl Engine {
             TransportConfig::Udp(udp_config) => {
                 self.spawn_udp(&connection, udp_config.clone())?;
                 true
+            }
+            TransportConfig::WebSocket(ws_config) => {
+                self.spawn_ws(&connection, ws_config.clone());
+                false
             }
         };
         if opens_at_once {
@@ -650,6 +658,65 @@ impl Engine {
                         finish(&connection, reason, &events);
                         break;
                     }
+                }
+            }
+        });
+    }
+
+    fn spawn_ws(&self, connection: &Arc<Connection>, config: WsConfig) {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<WsEvent>();
+        let mut link = ws::spawn_client(&config, events_tx, self.clock);
+        connection.set_writer(link.writes.clone());
+        connection.set_closer(Box::new(move || link.stop()));
+
+        let shared = Arc::clone(&connection.shared);
+        let spec = Arc::clone(&connection.decoder);
+        let clock = self.clock;
+        let version = Arc::clone(&self.version);
+        let events = self.events.clone();
+        let connection = Arc::clone(connection);
+        self.rt.spawn(async move {
+            let mut session = DataSession::new(SessionConfig::stream(*spec.read()));
+            let mut flush = tokio::time::interval(IDLE_FLUSH_INTERVAL);
+            let mut idle_watch: Option<(usize, Instant)> = None;
+            loop {
+                tokio::select! {
+                    _ = flush.tick() => {
+                        let pending = session.pending();
+                        match idle_watch {
+                            Some((count, since)) if count == pending && since.elapsed() >= IDLE_FLUSH_INTERVAL => {
+                                session.on_idle(clock.now(), &shared);
+                                version.fetch_add(1, Ordering::Release);
+                                idle_watch = None;
+                            }
+                            _ => idle_watch = Some((pending, Instant::now())),
+                        }
+                    }
+                    event = events_rx.recv() => match event {
+                        Some(WsEvent::Data { t, bytes }) => {
+                            let current = *spec.read();
+                            if current != session.spec() {
+                                session.reconfigure(SessionConfig::stream(current), &shared);
+                            }
+                            session.on_bytes(t, &bytes, &shared);
+                            version.fetch_add(1, Ordering::Release);
+                            connection.mark_rx();
+                        }
+                        Some(WsEvent::Info(text)) => {
+                            if text.starts_with("已连接") {
+                                connection.set_state(ConnectionState::Open);
+                            }
+                            let _ = events.send(Event::Info(format!(
+                                "{}：{text}",
+                                connection.config.kind()
+                            )));
+                        }
+                        Some(WsEvent::Ended(reason)) => {
+                            finish(&connection, reason, &events);
+                            break;
+                        }
+                        None => break,
+                    },
                 }
             }
         });

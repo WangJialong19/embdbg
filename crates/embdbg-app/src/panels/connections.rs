@@ -9,7 +9,7 @@ use embdbg_core::engine::{ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::DecoderSpec;
 use embdbg_core::transport::{
     FlowChoice, ParityChoice, PortInfo, SerialConfig, SimulatorConfig, TcpClientConfig,
-    TcpServerConfig, UdpConfig, list_ports,
+    TcpServerConfig, UdpConfig, WsConfig, list_ports,
 };
 
 use crate::fonts::{icon, icon_label};
@@ -34,6 +34,7 @@ fn interface_label(interface: Interface) -> &'static str {
         Interface::TcpClient => "TCP 客户端",
         Interface::TcpServer => "TCP 服务器",
         Interface::Udp => "UDP",
+        Interface::WebSocket => "WebSocket",
         Interface::Simulator => "模拟信号源",
     }
 }
@@ -45,6 +46,7 @@ fn interface_hint(interface: Interface) -> &'static str {
         Interface::TcpClient => "主动连接远端地址",
         Interface::TcpServer => "在本机监听，等待设备接入",
         Interface::Udp => "无连接收发，保留每条报文的边界",
+        Interface::WebSocket => "ws:// 或 wss:// 地址，文本与二进制都收",
         Interface::Simulator => "没有硬件时产生的 8 通道波形",
     }
 }
@@ -69,6 +71,7 @@ pub struct ConnectionsState {
     pub server_port: String,
     pub udp_port: String,
     pub udp_target: String,
+    pub ws_url: String,
 }
 
 impl Default for ConnectionsState {
@@ -116,6 +119,7 @@ impl ConnectionsState {
             server_port: form.server_port,
             udp_port: form.udp_port,
             udp_target: form.udp_target,
+            ws_url: form.ws_url,
         }
     }
 
@@ -135,6 +139,7 @@ impl ConnectionsState {
             server_port: self.server_port.clone(),
             udp_port: self.udp_port.clone(),
             udp_target: self.udp_target.clone(),
+            ws_url: self.ws_url.clone(),
             simulator_rate: RATES[self.rate],
         }
     }
@@ -181,6 +186,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
                 Interface::TcpClient,
                 Interface::TcpServer,
                 Interface::Udp,
+                Interface::WebSocket,
                 Interface::Simulator,
             ] {
                 ui.selectable_value(&mut state.interface, interface, interface_label(interface));
@@ -198,6 +204,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
         Interface::TcpClient => tcp_client_form(ui, engine, state, &mut action),
         Interface::TcpServer => tcp_server_form(ui, engine, state, &mut action),
         Interface::Udp => udp_form(ui, engine, state, &mut action),
+        Interface::WebSocket => ws_form(ui, engine, state, &mut action),
         Interface::Simulator => simulator_form(ui, engine, state),
     }
 
@@ -552,6 +559,39 @@ fn udp_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: 
                 }
             }
             Err(error) => *action = Action::Failed(error),
+        }
+    }
+}
+
+/// WebSocket: one URL and the button that connects.
+fn ws_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: &mut Action) {
+    Grid::new("ws-params")
+        .num_columns(2)
+        .spacing([SPACE_2, SPACE_1])
+        .show(ui, |ui| {
+            ui.label("地址");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.ws_url)
+                        .desired_width(150.0)
+                        .hint_text("ws://host:port/"),
+                );
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(SPACE_1);
+    let button = Button::new(icon_label(outline::WORLD_WWW, "连接", 13.0))
+        .min_size(vec2(ui.available_width(), 0.0))
+        .fill(theme::ACCENT.gamma_multiply(0.30));
+    if ui.add(button).clicked() {
+        let url = state.ws_url.trim();
+        if url.is_empty() {
+            *action = Action::Failed("WebSocket 地址不能为空".to_owned());
+        } else if let Err(error) = engine.open(TransportConfig::WebSocket(WsConfig {
+            url: url.to_owned(),
+        })) {
+            *action = Action::Failed(error);
         }
     }
 }

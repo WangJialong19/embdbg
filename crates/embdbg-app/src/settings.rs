@@ -58,6 +58,7 @@ pub enum Interface {
     TcpClient,
     TcpServer,
     Udp,
+    WebSocket,
     Simulator,
 }
 
@@ -82,6 +83,8 @@ pub struct ConnectionForm {
     pub udp_port: String,
     /// Where UDP sends go, as `host:port`; empty replies to the last sender.
     pub udp_target: String,
+    /// WebSocket address, `ws://` or `wss://`.
+    pub ws_url: String,
     /// Samples per second for the simulator.
     pub simulator_rate: f64,
 }
@@ -102,6 +105,7 @@ impl Default for ConnectionForm {
             server_port: "8080".to_owned(),
             udp_port: "9000".to_owned(),
             udp_target: String::new(),
+            ws_url: "ws://127.0.0.1:8080/".to_owned(),
             simulator_rate: 1e6,
         }
     }
