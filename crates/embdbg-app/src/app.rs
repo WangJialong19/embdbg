@@ -22,6 +22,7 @@ use crate::panels::hex::HexState;
 use crate::panels::histogram::HistogramState;
 use crate::panels::inspector::ChannelUi;
 use crate::panels::log::LogBuffer;
+use crate::panels::net_tools::NetToolsState;
 use crate::panels::send::SendState;
 use crate::panels::spectrum::SpectrumState;
 use crate::panels::terminal::TerminalState;
@@ -97,6 +98,7 @@ pub(crate) enum Tab {
     Terminal,
     Hex,
     Ai,
+    Tools,
     Send,
     Inspector,
     Log,
@@ -114,6 +116,7 @@ impl Tab {
             "terminal" => Self::Terminal,
             "hex" => Self::Hex,
             "ai" | "mcp" => Self::Ai,
+            "tools" | "net" | "network" => Self::Tools,
             "send" => Self::Send,
             "inspector" => Self::Inspector,
             "log" => Self::Log,
@@ -131,6 +134,7 @@ impl Tab {
             Tab::Terminal => "终端",
             Tab::Hex => "十六进制",
             Tab::Ai => "AI",
+            Tab::Tools => "网络工具",
             Tab::Send => "发送",
             Tab::Inspector => "通道",
             Tab::Log => "日志",
@@ -162,6 +166,7 @@ pub(crate) fn default_dock() -> egui_dock::DockState<Tab> {
         Tab::Terminal,
         Tab::Hex,
         Tab::Ai,
+        Tab::Tools,
     ]);
     let tree = dock.main_surface_mut();
     // `split_*` returns `[old, new]`, and the fraction is the share of whichever child comes
@@ -588,6 +593,7 @@ pub struct EmbDbgApp {
     spectrum: SpectrumState,
     histogram: HistogramState,
     ai: AiState,
+    net: NetToolsState,
     wave: WaveView,
     wave_scratch: WaveScratch,
     perf: PerfMonitor,
@@ -701,6 +707,7 @@ impl EmbDbgApp {
             spectrum: SpectrumState::default(),
             histogram: HistogramState::default(),
             ai: AiState::default(),
+            net: NetToolsState::default(),
             log,
             wave: WaveView::default(),
             wave_scratch: WaveScratch::default(),
@@ -846,6 +853,7 @@ impl EmbDbgApp {
             spectrum,
             histogram,
             ai,
+            net,
             ..
         } = self;
         let mut viewer = DockViewer {
@@ -862,6 +870,7 @@ impl EmbDbgApp {
             spectrum,
             histogram,
             ai,
+            net,
         };
         let width = ui.available_width();
         egui_dock::DockArea::new(dock)
@@ -947,6 +956,7 @@ struct DockViewer<'a> {
     spectrum: &'a mut SpectrumState,
     histogram: &'a mut HistogramState,
     ai: &'a mut AiState,
+    net: &'a mut NetToolsState,
 }
 
 impl egui_dock::TabViewer for DockViewer<'_> {
@@ -997,6 +1007,7 @@ impl egui_dock::TabViewer for DockViewer<'_> {
                 panels::hex::ui(ui, &shared, self.hex);
             }
             Tab::Ai => panels::ai::ui(ui, self.ai),
+            Tab::Tools => panels::net_tools::ui(ui, self.net, self.engine),
             Tab::Send => {
                 let active = self.engine.active();
                 if let Some(error) = panels::send::ui(ui, self.engine, active.as_deref(), self.send)
@@ -1388,6 +1399,7 @@ mod tests {
             Tab::Terminal,
             Tab::Hex,
             Tab::Ai,
+            Tab::Tools,
             Tab::Send,
             Tab::Inspector,
             Tab::Log,
@@ -1405,7 +1417,7 @@ mod tests {
         assert!(!channels_panel_open(&dock));
         // Everything else stays in the layout.
         let tabs: Vec<Tab> = dock.main_surface().tabs().copied().collect();
-        assert_eq!(tabs.len(), 10);
+        assert_eq!(tabs.len(), 11);
         assert!(!tabs.contains(&Tab::Inspector));
 
         set_channels_panel(&mut dock, true);
@@ -1428,7 +1440,7 @@ mod tests {
 
         set_connections_panel(&mut dock, false);
         assert!(!connections_panel_open(&dock));
-        assert_eq!(dock.main_surface().tabs().count(), 10);
+        assert_eq!(dock.main_surface().tabs().count(), 11);
 
         set_connections_panel(&mut dock, true);
         assert!(connections_panel_open(&dock));
@@ -1532,6 +1544,7 @@ mod tests {
                 Tab::Terminal,
                 Tab::Hex,
                 Tab::Ai,
+                Tab::Tools,
             ]
         );
         assert_eq!(tabs_at(center.right()), [Tab::Send, Tab::Log]);

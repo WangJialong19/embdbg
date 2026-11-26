@@ -15,10 +15,10 @@ use crate::app::Tab;
 use crate::logging;
 
 /// Bumped when the meaning of a saved layout changes; older files then fall back to the default.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// Every tab except the two closable side panels: those may be missing from a saved layout.
-const REQUIRED: [Tab; 9] = [
+const REQUIRED: [Tab; 10] = [
     Tab::Waveform,
     Tab::Xy,
     Tab::Spectrum,
@@ -26,6 +26,7 @@ const REQUIRED: [Tab; 9] = [
     Tab::Terminal,
     Tab::Hex,
     Tab::Ai,
+    Tab::Tools,
     Tab::Send,
     Tab::Log,
 ];

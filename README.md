@@ -124,7 +124,8 @@ tools/measure.ps1 内存/CPU 采样脚本
 - [x] **M2 MCP**：rmcp 3.11 服务、15 个工具、stdio 桥、命名管道接管窗口、无界面模式、AI 活动页签与截图工具。
   - 已用脚本端到端验证两条路径：无窗口时进程内服务；有窗口时 `embdbg mcp` 接管会话，工具调用会出现在界面的「AI」页签里。
   - 还需用真实 AI 客户端（ZCode）走一遍工具调用，并把"AI 写操作"的权限开关放到 M3 的网络工具里一起做。
-- [ ] **M3 网络**（进行中）：UDP、WebSocket、MQTT、Modbus TCP/RTU 主站已接入；Ping/端口扫描/DNS/HTTP 等网络小工具待做。
+- [x] **M3 网络**：UDP、WebSocket、MQTT、Modbus TCP/RTU 主站，以及「网络工具」页（DNS、TCP 连通性、端口扫描、HTTP 请求）。
+  - 网络工具里 HTTP 目前只支持 `http://`（HTTPS 待补），连通性用 TCP 连接测量而不是 ICMP；局域网设备发现留到后续。
 - [ ] **M4 WASM 插件**。
 - [ ] **M5 打磨发布**。
 

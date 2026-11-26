@@ -6,6 +6,7 @@ pub mod hex;
 pub mod histogram;
 pub mod inspector;
 pub mod log;
+pub mod net_tools;
 pub mod send;
 pub mod settings;
 pub mod spectrum;
