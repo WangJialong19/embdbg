@@ -21,8 +21,8 @@ use crate::analysis::{FftAnalyzer, Window, histogram};
 use crate::engine::{Connection, ConnectionState, Engine, TransportConfig};
 use crate::pipeline::Direction;
 use crate::transport::{
-    SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig, WsConfig,
-    list_ports,
+    MqttConfig, SerialConfig, SimulatorConfig, TcpClientConfig, TcpServerConfig, UdpConfig,
+    WsConfig, list_ports,
 };
 
 /// How many tool calls the activity feed keeps for the window.
@@ -435,6 +435,21 @@ impl McpService {
                     url: url.trim().to_owned(),
                 })
             }
+            TransportKind::Mqtt => {
+                let host = params
+                    .host
+                    .ok_or_else(|| "MQTT 需要 host（broker 地址）".to_owned())?;
+                TransportConfig::Mqtt(MqttConfig {
+                    host,
+                    port: params.tcp_port.unwrap_or(1883),
+                    client_id: String::new(),
+                    username: params.username.filter(|user| !user.trim().is_empty()),
+                    password: params.password.filter(|password| !password.is_empty()),
+                    subscribe: params.subscribe.unwrap_or_else(|| "embdbg/#".to_owned()),
+                    publish: params.publish.unwrap_or_else(|| "embdbg/tx".to_owned()),
+                    qos: params.qos.unwrap_or(0).min(2),
+                })
+            }
             TransportKind::Simulator => TransportConfig::Simulator(SimulatorConfig::default()),
         };
         let id = self.engine.open(config)?;
@@ -689,6 +704,8 @@ enum TransportKind {
     Udp,
     #[serde(rename = "websocket", alias = "web-socket")]
     WebSocket,
+    #[serde(rename = "mqtt")]
+    Mqtt,
     /// The built-in 8-channel signal generator, for testing the tools without hardware.
     Simulator,
 }
@@ -713,6 +730,14 @@ struct OpenParams {
     target: Option<String>,
     /// WebSocket address, `ws://` or `wss://`.
     url: Option<String>,
+    /// MQTT username and password; both optional.
+    username: Option<String>,
+    password: Option<String>,
+    /// MQTT topic filter to subscribe to and topic to publish on.
+    subscribe: Option<String>,
+    publish: Option<String>,
+    /// MQTT QoS level, 0 to 2.
+    qos: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]

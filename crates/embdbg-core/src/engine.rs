@@ -15,9 +15,9 @@ use crate::api::Event;
 use crate::clock::Clock;
 use crate::pipeline::{DataSession, DecoderSpec, SessionConfig, SessionShared};
 use crate::transport::{
-    SIM_CHANNEL_NAMES, SIM_CHANNELS, SerialConfig, SerialEvent, Simulator, SimulatorConfig,
-    TcpClientConfig, TcpEvent, TcpServerConfig, UdpConfig, UdpEvent, WsConfig, WsEvent, serial,
-    tcp, udp, ws,
+    MqttConfig, MqttEvent, SIM_CHANNEL_NAMES, SIM_CHANNELS, SerialConfig, SerialEvent, Simulator,
+    SimulatorConfig, TcpClientConfig, TcpEvent, TcpServerConfig, UdpConfig, UdpEvent, WsConfig,
+    WsEvent, mqtt, serial, tcp, udp, ws,
 };
 
 /// Identifies a connection for as long as the program runs.
@@ -44,6 +44,7 @@ pub enum TransportConfig {
     TcpServer(TcpServerConfig),
     Udp(UdpConfig),
     WebSocket(WsConfig),
+    Mqtt(MqttConfig),
 }
 
 impl TransportConfig {
@@ -56,6 +57,7 @@ impl TransportConfig {
             Self::TcpServer(_) => "TCP 服务器",
             Self::Udp(_) => "UDP",
             Self::WebSocket(_) => "WebSocket",
+            Self::Mqtt(_) => "MQTT",
         }
     }
 
@@ -70,6 +72,7 @@ impl TransportConfig {
             Self::TcpServer(config) => format!("{}:{}", config.bind, config.port),
             Self::Udp(config) => config.describe(),
             Self::WebSocket(config) => config.describe(),
+            Self::Mqtt(config) => config.describe(),
         }
     }
 
@@ -328,6 +331,10 @@ impl Engine {
             }
             TransportConfig::WebSocket(ws_config) => {
                 self.spawn_ws(&connection, ws_config.clone());
+                false
+            }
+            TransportConfig::Mqtt(mqtt_config) => {
+                self.spawn_mqtt(&connection, mqtt_config.clone());
                 false
             }
         };
@@ -717,6 +724,47 @@ impl Engine {
                         }
                         None => break,
                     },
+                }
+            }
+        });
+    }
+
+    fn spawn_mqtt(&self, connection: &Arc<Connection>, config: MqttConfig) {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<MqttEvent>();
+        let mut link = mqtt::spawn(&config, events_tx, self.clock);
+        connection.set_writer(link.writes.clone());
+        connection.set_closer(Box::new(move || link.stop()));
+
+        let shared = Arc::clone(&connection.shared);
+        let spec = Arc::clone(&connection.decoder);
+        let version = Arc::clone(&self.version);
+        let events = self.events.clone();
+        let connection = Arc::clone(connection);
+        self.rt.spawn(async move {
+            // One publish payload is one frame: MQTT keeps its boundaries like a datagram.
+            let mut session = DataSession::new(SessionConfig::datagram(*spec.read()));
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    MqttEvent::Data { t, bytes } => {
+                        let current = *spec.read();
+                        if current != session.spec() {
+                            session.reconfigure(SessionConfig::datagram(current), &shared);
+                        }
+                        session.on_bytes(t, &bytes, &shared);
+                        version.fetch_add(1, Ordering::Release);
+                        connection.mark_rx();
+                    }
+                    MqttEvent::Info(text) => {
+                        if text.starts_with("已连接") {
+                            connection.set_state(ConnectionState::Open);
+                        }
+                        let _ = events
+                            .send(Event::Info(format!("{}：{text}", connection.config.kind())));
+                    }
+                    MqttEvent::Ended(reason) => {
+                        finish(&connection, reason, &events);
+                        break;
+                    }
                 }
             }
         });

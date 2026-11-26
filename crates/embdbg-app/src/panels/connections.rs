@@ -8,7 +8,7 @@ use egui::{Button, ComboBox, Grid, RichText, Ui, vec2};
 use embdbg_core::engine::{ConnectionState, Engine, TransportConfig};
 use embdbg_core::pipeline::DecoderSpec;
 use embdbg_core::transport::{
-    FlowChoice, ParityChoice, PortInfo, SerialConfig, SimulatorConfig, TcpClientConfig,
+    FlowChoice, MqttConfig, ParityChoice, PortInfo, SerialConfig, SimulatorConfig, TcpClientConfig,
     TcpServerConfig, UdpConfig, WsConfig, list_ports,
 };
 
@@ -35,6 +35,7 @@ fn interface_label(interface: Interface) -> &'static str {
         Interface::TcpServer => "TCP 服务器",
         Interface::Udp => "UDP",
         Interface::WebSocket => "WebSocket",
+        Interface::Mqtt => "MQTT",
         Interface::Simulator => "模拟信号源",
     }
 }
@@ -47,6 +48,7 @@ fn interface_hint(interface: Interface) -> &'static str {
         Interface::TcpServer => "在本机监听，等待设备接入",
         Interface::Udp => "无连接收发，保留每条报文的边界",
         Interface::WebSocket => "ws:// 或 wss:// 地址，文本与二进制都收",
+        Interface::Mqtt => "订阅主题收数据，发送发布到另一个主题",
         Interface::Simulator => "没有硬件时产生的 8 通道波形",
     }
 }
@@ -72,6 +74,12 @@ pub struct ConnectionsState {
     pub udp_port: String,
     pub udp_target: String,
     pub ws_url: String,
+    pub mqtt_port: String,
+    pub mqtt_subscribe: String,
+    pub mqtt_publish: String,
+    pub mqtt_user: String,
+    pub mqtt_password: String,
+    pub mqtt_qos: u8,
 }
 
 impl Default for ConnectionsState {
@@ -120,6 +128,12 @@ impl ConnectionsState {
             udp_port: form.udp_port,
             udp_target: form.udp_target,
             ws_url: form.ws_url,
+            mqtt_port: form.mqtt_port,
+            mqtt_subscribe: form.mqtt_subscribe,
+            mqtt_publish: form.mqtt_publish,
+            mqtt_user: form.mqtt_user,
+            mqtt_password: form.mqtt_password,
+            mqtt_qos: form.mqtt_qos,
         }
     }
 
@@ -140,6 +154,12 @@ impl ConnectionsState {
             udp_port: self.udp_port.clone(),
             udp_target: self.udp_target.clone(),
             ws_url: self.ws_url.clone(),
+            mqtt_port: self.mqtt_port.clone(),
+            mqtt_subscribe: self.mqtt_subscribe.clone(),
+            mqtt_publish: self.mqtt_publish.clone(),
+            mqtt_user: self.mqtt_user.clone(),
+            mqtt_password: self.mqtt_password.clone(),
+            mqtt_qos: self.mqtt_qos,
             simulator_rate: RATES[self.rate],
         }
     }
@@ -187,6 +207,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
                 Interface::TcpServer,
                 Interface::Udp,
                 Interface::WebSocket,
+                Interface::Mqtt,
                 Interface::Simulator,
             ] {
                 ui.selectable_value(&mut state.interface, interface, interface_label(interface));
@@ -205,6 +226,7 @@ pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState) -> Action 
         Interface::TcpServer => tcp_server_form(ui, engine, state, &mut action),
         Interface::Udp => udp_form(ui, engine, state, &mut action),
         Interface::WebSocket => ws_form(ui, engine, state, &mut action),
+        Interface::Mqtt => mqtt_form(ui, engine, state, &mut action),
         Interface::Simulator => simulator_form(ui, engine, state),
     }
 
@@ -592,6 +614,101 @@ fn ws_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: &
             url: url.to_owned(),
         })) {
             *action = Action::Failed(error);
+        }
+    }
+}
+
+/// MQTT: broker, topics and the optional credentials.
+fn mqtt_form(ui: &mut Ui, engine: &Engine, state: &mut ConnectionsState, action: &mut Action) {
+    Grid::new("mqtt-params")
+        .num_columns(2)
+        .spacing([SPACE_2, SPACE_1])
+        .show(ui, |ui| {
+            ui.label("服务器");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut state.host).desired_width(96.0));
+                ui.label(":");
+                ui.add(egui::TextEdit::singleline(&mut state.mqtt_port).desired_width(50.0));
+            });
+            ui.end_row();
+
+            ui.label("订阅");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.mqtt_subscribe)
+                        .desired_width(150.0)
+                        .hint_text("embdbg/#"),
+                );
+            });
+            ui.end_row();
+
+            ui.label("发布");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.mqtt_publish)
+                        .desired_width(150.0)
+                        .hint_text("embdbg/tx"),
+                );
+            });
+            ui.end_row();
+
+            ui.label("用户名");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.mqtt_user)
+                        .desired_width(150.0)
+                        .hint_text("可留空"),
+                );
+            });
+            ui.end_row();
+
+            ui.label("密码");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.mqtt_password)
+                        .desired_width(150.0)
+                        .password(true),
+                );
+            });
+            ui.end_row();
+
+            ui.label("QoS");
+            ui.horizontal(|ui| {
+                ComboBox::from_id_salt("mqtt-qos")
+                    .width(90.0)
+                    .selected_text(state.mqtt_qos.to_string())
+                    .show_ui(ui, |ui| {
+                        for qos in [0, 1, 2] {
+                            ui.selectable_value(&mut state.mqtt_qos, qos, qos.to_string());
+                        }
+                    });
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(SPACE_1);
+    let button = Button::new(icon_label(outline::BROADCAST, "连接", 13.0))
+        .min_size(vec2(ui.available_width(), 0.0))
+        .fill(theme::ACCENT.gamma_multiply(0.30));
+    if ui.add(button).clicked() {
+        match parse_port(&state.mqtt_port) {
+            Ok(port) => {
+                let config = MqttConfig {
+                    host: state.host.clone(),
+                    port,
+                    client_id: String::new(),
+                    username: Some(state.mqtt_user.clone()).filter(|user| !user.trim().is_empty()),
+                    password: Some(state.mqtt_password.clone())
+                        .filter(|password| !password.is_empty()),
+                    subscribe: state.mqtt_subscribe.clone(),
+                    publish: state.mqtt_publish.clone(),
+                    qos: state.mqtt_qos.min(2),
+                };
+                if let Err(error) = engine.open(TransportConfig::Mqtt(config)) {
+                    *action = Action::Failed(error);
+                }
+            }
+            Err(error) => *action = Action::Failed(error),
         }
     }
 }

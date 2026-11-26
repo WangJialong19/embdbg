@@ -1,11 +1,13 @@
 //! Sources of bytes: real hardware, sockets and the built-in simulator.
 
+pub mod mqtt;
 pub mod serial;
 pub mod sim;
 pub mod tcp;
 pub mod udp;
 pub mod ws;
 
+pub use mqtt::{MqttConfig, MqttEvent, MqttLink};
 pub use serial::{
     FlowChoice, ParityChoice, PortInfo, SerialConfig, SerialEvent, SerialLink, list_ports,
 };

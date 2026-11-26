@@ -59,6 +59,7 @@ pub enum Interface {
     TcpServer,
     Udp,
     WebSocket,
+    Mqtt,
     Simulator,
 }
 
@@ -85,6 +86,13 @@ pub struct ConnectionForm {
     pub udp_target: String,
     /// WebSocket address, `ws://` or `wss://`.
     pub ws_url: String,
+    /// MQTT broker port, topic filter, publish topic, credentials and QoS.
+    pub mqtt_port: String,
+    pub mqtt_subscribe: String,
+    pub mqtt_publish: String,
+    pub mqtt_user: String,
+    pub mqtt_password: String,
+    pub mqtt_qos: u8,
     /// Samples per second for the simulator.
     pub simulator_rate: f64,
 }
@@ -106,6 +114,12 @@ impl Default for ConnectionForm {
             udp_port: "9000".to_owned(),
             udp_target: String::new(),
             ws_url: "ws://127.0.0.1:8080/".to_owned(),
+            mqtt_port: "1883".to_owned(),
+            mqtt_subscribe: "embdbg/#".to_owned(),
+            mqtt_publish: "embdbg/tx".to_owned(),
+            mqtt_user: String::new(),
+            mqtt_password: String::new(),
+            mqtt_qos: 0,
             simulator_rate: 1e6,
         }
     }
