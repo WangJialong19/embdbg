@@ -172,6 +172,8 @@ pub struct Settings {
     pub macros: Vec<SendMacro>,
     /// Custom terminal-tab names, keyed by `kind|default name`.
     pub terminal_names: BTreeMap<String, String>,
+    /// Tools open in the right-hand stack, by id.
+    pub stack_tools: Vec<String>,
 }
 
 impl Default for Settings {
@@ -182,6 +184,7 @@ impl Default for Settings {
             connections: ConnectionForm::default(),
             macros: Vec::new(),
             terminal_names: BTreeMap::new(),
+            stack_tools: vec!["channels".to_owned()],
         }
     }
 }
@@ -281,6 +284,7 @@ mod tests {
                 ..SendMacro::default()
             }],
             terminal_names: BTreeMap::from([("串口|COM5".to_owned(), "主板".to_owned())]),
+            stack_tools: vec!["channels".to_owned(), "hex".to_owned()],
         };
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), settings);

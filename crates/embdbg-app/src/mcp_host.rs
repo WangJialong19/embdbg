@@ -20,21 +20,32 @@ use tokio::sync::broadcast;
 /// The local socket both sides look for. Namespaced, so no file is left behind.
 pub const ENDPOINT: &str = "embdbg-mcp";
 
+/// Gives this process its own endpoint, so two windows can each serve an MCP session.
+const ENDPOINT_ENV: &str = "EMBDBG_MCP_ENDPOINT";
+
+fn endpoint() -> String {
+    std::env::var(ENDPOINT_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| ENDPOINT.to_owned())
+}
+
 /// Starts the window's MCP endpoint. Returns the feed the AI panel shows.
 pub fn spawn_server(
     engine: Arc<Engine>,
     screenshot: Option<ScreenshotPort>,
 ) -> broadcast::Receiver<Activity> {
     let (activity, feed) = embdbg_core::mcp::activity_channel();
+    let endpoint = endpoint();
     engine.runtime().spawn(async move {
-        let listener = match listen() {
+        let listener = match listen(&endpoint) {
             Ok(listener) => listener,
             Err(error) => {
-                tracing::warn!(target: "embdbg::mcp", "MCP 端点启动失败：{error}");
+                tracing::warn!(target: "embdbg::mcp", "MCP 端点 {endpoint} 启动失败：{error}");
                 return;
             }
         };
-        tracing::info!(target: "embdbg::mcp", "MCP 端点已就绪：{ENDPOINT}");
+        tracing::info!(target: "embdbg::mcp", "MCP 端点已就绪：{endpoint}");
         loop {
             match listener.accept().await {
                 Ok(stream) => {
@@ -67,8 +78,8 @@ pub fn spawn_server(
     feed
 }
 
-fn listen() -> std::io::Result<Listener> {
-    let name = ENDPOINT.to_ns_name::<GenericNamespaced>()?;
+fn listen(endpoint: &str) -> std::io::Result<Listener> {
+    let name = endpoint.to_ns_name::<GenericNamespaced>()?;
     ListenerOptions::new().name(name).create_tokio()
 }
 
@@ -94,7 +105,8 @@ pub fn run_stdio() -> anyhow::Result<()> {
 }
 
 async fn connect() -> Option<LocalSocketStream> {
-    let name = ENDPOINT.to_ns_name::<GenericNamespaced>().ok()?;
+    let endpoint = endpoint();
+    let name = endpoint.to_ns_name::<GenericNamespaced>().ok()?;
     LocalSocketStream::connect(name).await.ok()
 }
 

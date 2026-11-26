@@ -25,6 +25,7 @@ use crate::panels::log::LogBuffer;
 use crate::panels::net_tools::NetToolsState;
 use crate::panels::send::SendState;
 use crate::panels::spectrum::SpectrumState;
+use crate::panels::stack::{StackState, StackTool};
 use crate::panels::terminal::TerminalState;
 use crate::panels::xy::XyState;
 use crate::plots::wave::{WaveScratch, WaveView};
@@ -33,11 +34,14 @@ use crate::theme;
 use crate::util::{format_count, format_rate};
 
 const TOOLBAR_HEIGHT: f32 = 38.0;
+const MENUBAR_HEIGHT: f32 = 26.0;
 const STATUSBAR_HEIGHT: f32 = 24.0;
 
 /// What the rest of the window keeps when the channel table is split off to the right; the table
 /// takes the remainder. `split_right` gives the fraction to the old, left-hand side.
 const INSPECTOR_SPLIT: f32 = 0.56;
+/// What the main views keep when the tool stack is split off to the right.
+const TOOLSTACK_SPLIT: f32 = 0.5;
 
 /// Share of the window width the left sidebar starts with.
 const SIDEBAR_SPLIT: f32 = 0.18;
@@ -95,13 +99,7 @@ pub(crate) enum Tab {
     Xy,
     Spectrum,
     Histogram,
-    Terminal,
-    Hex,
-    Ai,
-    Tools,
-    Send,
-    Inspector,
-    Log,
+    ToolStack,
 }
 
 impl Tab {
@@ -113,13 +111,9 @@ impl Tab {
             "xy" => Self::Xy,
             "spectrum" | "fft" => Self::Spectrum,
             "histogram" | "hist" => Self::Histogram,
-            "terminal" => Self::Terminal,
-            "hex" => Self::Hex,
-            "ai" | "mcp" => Self::Ai,
-            "tools" | "net" | "network" => Self::Tools,
-            "send" => Self::Send,
-            "inspector" => Self::Inspector,
-            "log" => Self::Log,
+            // The tools live in the right-hand stack now; these names select it.
+            "terminal" | "hex" | "ai" | "mcp" | "send" | "log" | "inspector" | "channels"
+            | "tools" | "toolstack" | "net" | "network" => Self::ToolStack,
             _ => return None,
         })
     }
@@ -131,13 +125,7 @@ impl Tab {
             Tab::Xy => "X-Y",
             Tab::Spectrum => "频谱",
             Tab::Histogram => "直方图",
-            Tab::Terminal => "终端",
-            Tab::Hex => "十六进制",
-            Tab::Ai => "AI",
-            Tab::Tools => "网络工具",
-            Tab::Send => "发送",
-            Tab::Inspector => "通道",
-            Tab::Log => "日志",
+            Tab::ToolStack => "工具",
         }
     }
 }
@@ -158,24 +146,15 @@ fn startup_dock(initial_tab: Option<&str>) -> egui_dock::DockState<Tab> {
 pub(crate) fn default_dock() -> egui_dock::DockState<Tab> {
     use egui_dock::NodeIndex;
 
-    let mut dock = egui_dock::DockState::new(vec![
-        Tab::Waveform,
-        Tab::Xy,
-        Tab::Spectrum,
-        Tab::Histogram,
-        Tab::Terminal,
-        Tab::Hex,
-        Tab::Ai,
-        Tab::Tools,
-    ]);
+    let mut dock =
+        egui_dock::DockState::new(vec![Tab::Waveform, Tab::Xy, Tab::Spectrum, Tab::Histogram]);
     let tree = dock.main_surface_mut();
     // `split_*` returns `[old, new]`, and the fraction is the share of whichever child comes
     // first in layout order: the new node for a split to the left, the old one otherwise.
     let [center, _sidebar] =
         tree.split_left(NodeIndex::root(), SIDEBAR_SPLIT, vec![Tab::Connections]);
-    // The channel table needs about 430 points at the default window size.
-    let [center, _inspector] = tree.split_right(center, INSPECTOR_SPLIT, vec![Tab::Inspector]);
-    let [_center, _bottom] = tree.split_below(center, 0.68, vec![Tab::Send, Tab::Log]);
+    // The tool stack keeps the other half: terminals side by side need the width.
+    let [_center, _tools] = tree.split_right(center, TOOLSTACK_SPLIT, vec![Tab::ToolStack]);
     dock
 }
 
@@ -224,29 +203,28 @@ fn clamp_connections_width(dock: &mut egui_dock::DockState<Tab>, width: f32) {
     }
 }
 
-/// Whether the channel table is part of the layout.
-pub(crate) fn channels_panel_open(dock: &egui_dock::DockState<Tab>) -> bool {
-    dock.find_tab(&Tab::Inspector).is_some()
+/// Whether the tool stack is part of the layout.
+pub(crate) fn toolstack_panel_open(dock: &egui_dock::DockState<Tab>) -> bool {
+    dock.find_tab(&Tab::ToolStack).is_some()
 }
 
-/// Closes or reopens the channel table. Reopening puts it back against the right edge, at the
-/// same proportion it starts with.
-pub(crate) fn set_channels_panel(dock: &mut egui_dock::DockState<Tab>, open: bool) {
-    if open == channels_panel_open(dock) {
+/// Closes or reopens the tool stack against the right edge.
+pub(crate) fn set_toolstack_panel(dock: &mut egui_dock::DockState<Tab>, open: bool) {
+    if open == toolstack_panel_open(dock) {
         return;
     }
     if open {
         if dock.main_surface().root_node().is_none() {
-            // Nothing left to split: the table becomes the whole surface.
-            dock.push_to_focused_leaf(Tab::Inspector);
+            // Nothing left to split: the stack becomes the whole surface.
+            dock.push_to_focused_leaf(Tab::ToolStack);
         } else {
             dock.main_surface_mut().split_right(
                 egui_dock::NodeIndex::root(),
                 INSPECTOR_SPLIT,
-                vec![Tab::Inspector],
+                vec![Tab::ToolStack],
             );
         }
-    } else if let Some(path) = dock.find_tab(&Tab::Inspector) {
+    } else if let Some(path) = dock.find_tab(&Tab::ToolStack) {
         dock.remove_tab(path);
     }
 }
@@ -599,6 +577,10 @@ pub struct EmbDbgApp {
     perf: PerfMonitor,
     perf_test: Option<PerfTest>,
     screenshot: Option<ScreenshotRequest>,
+    /// The right-hand stack: terminals and the tools opened from the menu.
+    stack: StackState,
+    /// Whether the about window is open.
+    about_open: bool,
     /// Whether the settings window is open.
     settings_open: bool,
     /// The edits in that window, saved on request.
@@ -714,6 +696,8 @@ impl EmbDbgApp {
             perf: PerfMonitor::default(),
             perf_test,
             screenshot,
+            stack: StackState::from_settings(&saved.stack_tools),
+            about_open: false,
             settings_open: open_settings,
             pending,
             saved,
@@ -760,22 +744,73 @@ impl EmbDbgApp {
                 {
                     set_connections_panel(&mut self.dock, !connections_open);
                 }
-                let open = channels_panel_open(&self.dock);
-                let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR_RIGHT, "通道", 13.5))
+                let open = toolstack_panel_open(&self.dock);
+                let toggle = Button::new(icon_label(outline::LAYOUT_SIDEBAR_RIGHT, "工具", 13.5))
                     .selected(open);
                 if ui
                     .add(toggle)
                     .on_hover_text(if open {
-                        "隐藏右侧的通道面板"
+                        "隐藏右侧的工具栈"
                     } else {
-                        "显示右侧的通道面板"
+                        "显示右侧的工具栈"
                     })
                     .clicked()
                 {
-                    set_channels_panel(&mut self.dock, !open);
+                    set_toolstack_panel(&mut self.dock, !open);
                 }
                 ui.separator();
                 ui.label(RichText::new(&self.backend).small().color(theme::FG_DIM));
+            });
+        });
+    }
+
+    /// The row of menus: tools to open, panel visibility, and about.
+    fn menu_bar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(theme::SPACE_2);
+            ui.menu_button("工具", |ui| {
+                for tool in StackTool::ALL {
+                    let mut open = self.stack.is_open(tool);
+                    if ui.checkbox(&mut open, tool.title()).changed() {
+                        self.stack.set_open(tool, open);
+                    }
+                }
+                ui.separator();
+                if ui.button("全部关闭").clicked() {
+                    for tool in StackTool::ALL {
+                        self.stack.set_open(tool, false);
+                    }
+                    ui.close();
+                }
+            });
+            ui.menu_button("窗口", |ui| {
+                let mut connections = connections_panel_open(&self.dock);
+                if ui.checkbox(&mut connections, "连接栏").changed() {
+                    set_connections_panel(&mut self.dock, connections);
+                }
+                let mut stack = toolstack_panel_open(&self.dock);
+                if ui.checkbox(&mut stack, "工具栈").changed() {
+                    set_toolstack_panel(&mut self.dock, stack);
+                }
+                ui.separator();
+                if ui.button("重置布局").clicked() {
+                    self.dock = default_dock();
+                    ui.close();
+                }
+            });
+            ui.menu_button("帮助", |ui| {
+                if ui.button("关于 embdbg").clicked() {
+                    self.about_open = true;
+                    ui.close();
+                }
+                ui.hyperlink_to("GitHub 仓库", "https://github.com/WangJialong19/embdbg");
+            });
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new("「工具」菜单里打开终端以外的面板，面板右上角可关闭")
+                        .small()
+                        .color(theme::FG_DIM),
+                );
             });
         });
     }
@@ -854,6 +889,7 @@ impl EmbDbgApp {
             histogram,
             ai,
             net,
+            stack,
             ..
         } = self;
         let mut viewer = DockViewer {
@@ -871,6 +907,7 @@ impl EmbDbgApp {
             histogram,
             ai,
             net,
+            stack,
         };
         let width = ui.available_width();
         egui_dock::DockArea::new(dock)
@@ -883,6 +920,7 @@ impl EmbDbgApp {
             // Dragging the junction resizes several panes at once, which is how the sidebar used
             // to shrink upwards as well. Individual separators are still draggable.
             .draggable_separator_junctions(false)
+            .draggable_tabs(false)
             .show_inside(ui, &mut viewer);
         clamp_connections_width(dock, width);
     }
@@ -957,6 +995,7 @@ struct DockViewer<'a> {
     histogram: &'a mut HistogramState,
     ai: &'a mut AiState,
     net: &'a mut NetToolsState,
+    stack: &'a mut StackState,
 }
 
 impl egui_dock::TabViewer for DockViewer<'_> {
@@ -997,32 +1036,25 @@ impl egui_dock::TabViewer for DockViewer<'_> {
                 let shared = self.engine.active_shared();
                 panels::histogram::ui(ui, &shared, self.histogram);
             }
-            Tab::Terminal => panels::terminal::ui(ui, self.engine, self.terminal),
-            Tab::Hex => {
-                let shared = self.engine.active_shared();
-                panels::hex::ui(ui, &shared, self.hex);
+            Tab::ToolStack => {
+                let panels = panels::stack::StackPanels {
+                    channels: self.channels,
+                    terminal: self.terminal,
+                    hex: self.hex,
+                    send: self.send,
+                    log: self.log,
+                    ai: self.ai,
+                    net: self.net,
+                };
+                panels::stack::ui(ui, self.engine, self.stack, panels);
             }
-            Tab::Ai => panels::ai::ui(ui, self.ai),
-            Tab::Tools => panels::net_tools::ui(ui, self.net, self.engine),
-            Tab::Send => {
-                let active = self.engine.active();
-                if let Some(error) = panels::send::ui(ui, self.engine, active.as_deref(), self.send)
-                {
-                    self.log.error(error);
-                }
-            }
-            Tab::Inspector => {
-                let shared = self.engine.active_shared();
-                panels::inspector::ui(ui, &shared, self.channels);
-            }
-            Tab::Log => panels::log::ui(ui, self.log),
         }
     }
 
-    /// The two side panels can be closed, from their tabs or from the toolbar; the data views
-    /// stay. `set_connections_panel` and `set_channels_panel` reopen them.
+    /// The two side panels can be closed, from their tabs or from the toolbar; the main views
+    /// stay. `set_connections_panel` and `set_toolstack_panel` reopen them.
     fn is_closeable(&self, tab: &Tab) -> bool {
-        matches!(tab, Tab::Connections | Tab::Inspector)
+        matches!(tab, Tab::Connections | Tab::ToolStack)
     }
 }
 
@@ -1198,6 +1230,10 @@ impl eframe::App for EmbDbgApp {
             .exact_size(TOOLBAR_HEIGHT)
             .frame(bar())
             .show(ui, |ui| self.toolbar(ui));
+        egui::Panel::top("menubar")
+            .exact_size(MENUBAR_HEIGHT)
+            .frame(bar())
+            .show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("statusbar")
             .exact_size(STATUSBAR_HEIGHT)
             .frame(bar())
@@ -1215,9 +1251,13 @@ impl eframe::App for EmbDbgApp {
         if self.terminal.take_names_changed() {
             self.save_terminal_names();
         }
+        if self.stack.take_changed() {
+            self.save_stack_tools();
+        }
 
         let ctx = ui.ctx().clone();
         self.handle_settings(&ctx);
+        self.about_window(&ctx);
 
         let ui_ms = started.elapsed().as_secs_f32() * 1000.0;
         let frame_time = self.perf.observe(&ctx);
@@ -1240,6 +1280,9 @@ impl eframe::App for EmbDbgApp {
         }
         if self.terminal.take_names_changed() {
             self.save_terminal_names();
+        }
+        if self.stack.take_changed() {
+            self.save_stack_tools();
         }
     }
 }
@@ -1281,6 +1324,27 @@ impl EmbDbgApp {
             }
             Err(error) => self.log.error(format!("保存设置失败：{error}")),
         }
+    }
+
+    /// A small about window: version, purpose, repository.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        egui::Window::new("关于 embdbg")
+            .open(&mut self.about_open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("embdbg {}", env!("CARGO_PKG_VERSION"))).strong());
+                ui.label(
+                    RichText::new("串口、网络、波形与 AI 验证，一个窗口里完成。")
+                        .color(theme::FG_DIM),
+                );
+                ui.separator();
+                ui.hyperlink_to("GitHub 仓库", "https://github.com/WangJialong19/embdbg");
+                ui.label(RichText::new(&self.backend).small().color(theme::FG_DIM));
+            });
     }
 
     /// Writes the dock layout when it has changed since the last check: a tab moved, the channel
@@ -1347,6 +1411,18 @@ impl EmbDbgApp {
         }
     }
 
+    /// Writes which tools are open in the right-hand stack.
+    fn save_stack_tools(&mut self) {
+        let tools = self.stack.ids();
+        let mut next = self.saved.clone();
+        next.stack_tools = tools.clone();
+        self.pending.stack_tools = tools;
+        match next.save() {
+            Ok(()) => self.saved = next,
+            Err(error) => self.log.error(format!("保存工具面板设置失败：{error}")),
+        }
+    }
+
     /// Writes the custom terminal-tab names.
     fn save_terminal_names(&mut self) {
         let names = self.terminal.names().clone();
@@ -1410,32 +1486,26 @@ mod tests {
             Tab::Xy,
             Tab::Spectrum,
             Tab::Histogram,
-            Tab::Terminal,
-            Tab::Hex,
-            Tab::Ai,
-            Tab::Tools,
-            Tab::Send,
-            Tab::Inspector,
-            Tab::Log,
+            Tab::ToolStack,
         ];
         expected.sort_by_key(|tab| tab.title());
         assert_eq!(tabs, expected);
     }
 
     #[test]
-    fn the_channel_panel_closes_and_reopens_on_the_right() {
+    fn the_tool_stack_closes_and_reopens_on_the_right() {
         let mut dock = default_dock();
-        assert!(channels_panel_open(&dock));
+        assert!(toolstack_panel_open(&dock));
 
-        set_channels_panel(&mut dock, false);
-        assert!(!channels_panel_open(&dock));
+        set_toolstack_panel(&mut dock, false);
+        assert!(!toolstack_panel_open(&dock));
         // Everything else stays in the layout.
         let tabs: Vec<Tab> = dock.main_surface().tabs().copied().collect();
-        assert_eq!(tabs.len(), 11);
-        assert!(!tabs.contains(&Tab::Inspector));
+        assert_eq!(tabs.len(), 5);
+        assert!(!tabs.contains(&Tab::ToolStack));
 
-        set_channels_panel(&mut dock, true);
-        assert!(channels_panel_open(&dock));
+        set_toolstack_panel(&mut dock, true);
+        assert!(toolstack_panel_open(&dock));
         // It comes back against the right edge, where it started.
         let tree = dock.main_surface();
         let root = egui_dock::NodeIndex::root();
@@ -1444,7 +1514,7 @@ mod tests {
             .tabs()
             .map(<[Tab]>::to_vec)
             .unwrap_or_default();
-        assert_eq!(right, [Tab::Inspector]);
+        assert_eq!(right, [Tab::ToolStack]);
     }
 
     #[test]
@@ -1454,7 +1524,7 @@ mod tests {
 
         set_connections_panel(&mut dock, false);
         assert!(!connections_panel_open(&dock));
-        assert_eq!(dock.main_surface().tabs().count(), 11);
+        assert_eq!(dock.main_surface().tabs().count(), 5);
 
         set_connections_panel(&mut dock, true);
         assert!(connections_panel_open(&dock));
@@ -1544,24 +1614,14 @@ mod tests {
 
         let rest = root.right();
         assert!(tree[rest].is_horizontal());
-        assert_eq!(tabs_at(rest.right()), [Tab::Inspector]);
+        assert_eq!(tabs_at(rest.right()), [Tab::ToolStack]);
 
         let center = rest.left();
-        assert!(tree[center].is_vertical());
+        assert!(tree[center].is_leaf());
         assert_eq!(
-            tabs_at(center.left()),
-            [
-                Tab::Waveform,
-                Tab::Xy,
-                Tab::Spectrum,
-                Tab::Histogram,
-                Tab::Terminal,
-                Tab::Hex,
-                Tab::Ai,
-                Tab::Tools,
-            ]
+            tabs_at(center),
+            [Tab::Waveform, Tab::Xy, Tab::Spectrum, Tab::Histogram]
         );
-        assert_eq!(tabs_at(center.right()), [Tab::Send, Tab::Log]);
     }
 
     #[test]

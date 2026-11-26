@@ -15,21 +15,10 @@ use crate::app::Tab;
 use crate::logging;
 
 /// Bumped when the meaning of a saved layout changes; older files then fall back to the default.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
-/// Every tab except the two closable side panels: those may be missing from a saved layout.
-const REQUIRED: [Tab; 10] = [
-    Tab::Waveform,
-    Tab::Xy,
-    Tab::Spectrum,
-    Tab::Histogram,
-    Tab::Terminal,
-    Tab::Hex,
-    Tab::Ai,
-    Tab::Tools,
-    Tab::Send,
-    Tab::Log,
-];
+/// Every main view; the two closable side panels may be missing from a saved layout.
+const REQUIRED: [Tab; 4] = [Tab::Waveform, Tab::Xy, Tab::Spectrum, Tab::Histogram];
 
 #[derive(Serialize)]
 struct Saved<'a> {
@@ -77,9 +66,7 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
             return None;
         }
     };
-    // Version 2 layouts predate the AI and network-tool tabs; they are upgraded in place below,
-    // so a window that was arranged by hand keeps its arrangement.
-    if loaded.version < 1 || loaded.version > VERSION {
+    if loaded.version != VERSION {
         tracing::warn!(
             target: "embdbg::layout",
             "布局版本 {} 与当前 {} 不兼容，使用默认布局",
@@ -90,7 +77,6 @@ fn load_from(path: &Path) -> Option<DockState<Tab>> {
     }
     let mut dock = loaded.dock;
     expand(&mut dock);
-    add_missing_tabs(&mut dock);
     if !is_usable(&dock) {
         tracing::warn!(
             target: "embdbg::layout",
@@ -141,28 +127,6 @@ fn write_to(path: &Path, text: &str) -> anyhow::Result<()> {
 /// Whether the layout is one this build can use: every required tab exactly once, and at most
 /// one of each side panel. Anything else (a layout from another version, a hand-edited file)
 /// falls back to the default instead of starting with tabs missing.
-/// Adds tabs introduced after the layout was saved, next to the waveform tab, so an older
-/// layout keeps everything else exactly where it was.
-fn add_missing_tabs(dock: &mut DockState<Tab>) {
-    let center = dock
-        .main_surface()
-        .find_tab(&Tab::Waveform)
-        .map(|(node, _)| node);
-    for tab in [Tab::Ai, Tab::Tools] {
-        if dock.find_tab(&tab).is_some() {
-            continue;
-        }
-        if let Some(node) = center {
-            if let Some(leaf) = dock.main_surface_mut()[node].get_leaf_mut() {
-                let index = leaf.tabs().len();
-                leaf.insert_tab(index, tab);
-            }
-        } else {
-            dock.push_to_focused_leaf(tab);
-        }
-    }
-}
-
 /// Undoes egui_dock's pane folding. A saved layout should never reopen as a blank strip, and a
 /// pane folded by an older version comes back with its contents.
 fn expand(dock: &mut DockState<Tab>) {
@@ -206,9 +170,9 @@ mod tests {
     }
 
     #[test]
-    fn a_layout_round_trips_with_the_channel_table_closed() {
+    fn a_layout_round_trips_with_the_tool_stack_closed() {
         let mut dock = default_dock();
-        crate::app::set_channels_panel(&mut dock, false);
+        crate::app::set_toolstack_panel(&mut dock, false);
         let text = serialize(&dock).unwrap();
 
         let dir = temp_dir();
@@ -219,23 +183,23 @@ mod tests {
             loaded.main_surface().tabs().copied().collect::<Vec<Tab>>(),
             dock.main_surface().tabs().copied().collect::<Vec<Tab>>()
         );
-        assert!(!crate::app::channels_panel_open(&loaded));
+        assert!(!crate::app::toolstack_panel_open(&loaded));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_moved_tab_keeps_its_place() {
         let mut dock = default_dock();
-        let terminal = dock
-            .find_tab(&Tab::Terminal)
-            .expect("the terminal is in the default layout");
+        let xy = dock
+            .find_tab(&Tab::Xy)
+            .expect("X-Y is in the default layout");
         let center = dock
             .find_tab(&Tab::Waveform)
             .expect("the waveform is in the default layout")
             .node_path();
-        dock.move_tab(terminal, (center, egui_dock::TabInsert::Insert(0.into())));
+        dock.move_tab(xy, (center, egui_dock::TabInsert::Insert(0.into())));
         assert_eq!(
-            dock.main_surface().find_tab(&Tab::Terminal).unwrap().1,
+            dock.main_surface().find_tab(&Tab::Xy).unwrap().1,
             egui_dock::TabIndex(0)
         );
 
@@ -245,7 +209,7 @@ mod tests {
         write_to(&path, &text).unwrap();
         let loaded = load_from(&path).expect("a saved layout loads");
         assert_eq!(
-            loaded.main_surface().find_tab(&Tab::Terminal).unwrap().1,
+            loaded.main_surface().find_tab(&Tab::Xy).unwrap().1,
             egui_dock::TabIndex(0)
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -277,40 +241,15 @@ mod tests {
     #[test]
     fn a_layout_with_both_side_panels_closed_round_trips() {
         let mut dock = default_dock();
-        crate::app::set_channels_panel(&mut dock, false);
+        crate::app::set_toolstack_panel(&mut dock, false);
         crate::app::set_connections_panel(&mut dock, false);
         let text = serialize(&dock).unwrap();
         let dir = temp_dir();
         let path = dir.join("layout.json");
         write_to(&path, &text).unwrap();
         let loaded = load_from(&path).expect("a layout without the side panels loads");
-        assert!(!crate::app::channels_panel_open(&loaded));
+        assert!(!crate::app::toolstack_panel_open(&loaded));
         assert!(!crate::app::connections_panel_open(&loaded));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_older_layout_gains_the_new_tabs_without_losing_its_arrangement() {
-        let mut dock = default_dock();
-        for tab in [Tab::Ai, Tab::Tools] {
-            if let Some(path) = dock.find_tab(&tab) {
-                dock.remove_tab(path);
-            }
-        }
-        let text = serialize(&dock).unwrap().replacen(
-            &format!("\"version\": {VERSION}"),
-            "\"version\": 2",
-            1,
-        );
-
-        let dir = temp_dir();
-        let path = dir.join("layout.json");
-        write_to(&path, &text).unwrap();
-        let loaded = load_from(&path).expect("an older layout should be upgraded");
-        assert!(loaded.find_tab(&Tab::Ai).is_some());
-        assert!(loaded.find_tab(&Tab::Tools).is_some());
-        // The tab that was there keeps its place in the center stack.
-        assert!(loaded.find_tab(&Tab::Waveform).is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

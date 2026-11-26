@@ -10,5 +10,6 @@ pub mod net_tools;
 pub mod send;
 pub mod settings;
 pub mod spectrum;
+pub mod stack;
 pub mod terminal;
 pub mod xy;

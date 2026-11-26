@@ -54,8 +54,9 @@ impl Selection {
     }
 }
 
+/// One connection's terminal screen state: grid size, selection and IME composition.
 #[derive(Debug, Default)]
-pub struct TerminalState {
+struct TerminalPane {
     /// The grid size the parser was last told about.
     size: (u16, u16),
     /// Pending IME composition, drawn at the cursor until it commits.
@@ -65,18 +66,15 @@ pub struct TerminalState {
     /// How many lines the scrollback held when the selection began. The view scrolls back in
     /// step with that number, so new output does not slide the cells out from under the mouse.
     selection_scrollback: usize,
-    /// The connection whose terminal is on screen. It is deliberately independent of the
-    /// engine's active connection, so watching a console does not follow the other views.
-    selected: Option<ConnectionId>,
-    /// Connections seen last frame, to notice a newly opened one.
-    known: Vec<ConnectionId>,
-    /// The connection last drawn, so switching tabs resets the grid and input state.
-    shown: Option<ConnectionId>,
-    /// Custom tab names, keyed by [`connection_key`].
+}
+
+#[derive(Debug, Default)]
+pub struct TerminalState {
+    /// One screen state per connection, so side-by-side terminals do not share a selection.
+    panes: BTreeMap<ConnectionId, TerminalPane>,
+    /// Custom names, keyed by [`connection_key`].
     names: BTreeMap<String, String>,
-    /// Set when a name was changed, so the app writes the settings.
     names_changed: bool,
-    /// The connection being renamed, if the tab is in its editor.
     editing: Option<ConnectionId>,
     rename_draft: String,
 }
@@ -94,13 +92,13 @@ impl TerminalState {
         &self.names
     }
 
-    /// Whether a tab was renamed since the last save; the flag is cleared.
+    /// Whether a terminal was renamed since the last save; the flag is cleared.
     pub fn take_names_changed(&mut self) -> bool {
         std::mem::take(&mut self.names_changed)
     }
 }
 
-/// The tab label when the user has not renamed the connection.
+/// The header label when the user has not renamed the connection.
 pub fn default_name(config: &TransportConfig) -> String {
     match config {
         TransportConfig::Simulator(_) => "模拟源".to_owned(),
@@ -117,8 +115,8 @@ pub fn default_name(config: &TransportConfig) -> String {
     }
 }
 
-/// The key a custom tab name is stored under. It stays the same when the port's baud rate or a
-/// protocol setting changes, so renaming COM5 survives a reopen.
+/// The key a custom name is stored under. It stays the same when a protocol setting changes, so
+/// renaming COM5 survives a reopen.
 fn connection_key(config: &TransportConfig) -> String {
     format!("{}|{}", config.kind(), default_name(config))
 }
@@ -132,105 +130,113 @@ fn state_color(state: &ConnectionState) -> Color32 {
     }
 }
 
-/// Draws one tab per connection and the terminal of the selected one.
-pub fn ui(ui: &mut Ui, engine: &Engine, state: &mut TerminalState) {
+/// Draws one terminal column per connection, side by side. Returns false when there is none.
+pub fn columns(ui: &mut Ui, engine: &Engine, state: &mut TerminalState) -> bool {
     let connections = engine.connections();
     if connections.is_empty() {
-        ui.label(
-            RichText::new("先打开一个连接，每个连接都会有自己的一页终端。").color(theme::FG_DIM),
-        );
-        return;
+        return false;
     }
-
-    // A newly opened connection comes to the front; a connection that disappeared falls back to
-    // the engine's active one, then to the first.
     let ids: Vec<ConnectionId> = connections.iter().map(|connection| connection.id).collect();
-    if let Some(new) = ids.iter().find(|id| !state.known.contains(id)).copied() {
-        state.selected = Some(new);
-    }
-    state.known = ids.clone();
-    if !state.selected.is_some_and(|id| ids.contains(&id)) {
-        state.selected = engine
-            .active_id()
-            .filter(|id| ids.contains(id))
-            .or_else(|| ids.first().copied());
-    }
-    terminal_tabs(ui, &connections, state);
+    state.panes.retain(|id, _| ids.contains(id));
 
-    let Some(connection) = state
-        .selected
-        .and_then(|id| connections.iter().find(|connection| connection.id == id))
-        .cloned()
-    else {
-        return;
-    };
-    if state.shown != Some(connection.id) {
-        state.shown = Some(connection.id);
-        state.size = (0, 0);
-        state.selection = None;
-        state.preedit.clear();
-    }
-    body(ui, engine, &connection, &connection.shared, state);
+    let count = ids.len() as f32;
+    let spacing = ui.spacing().item_spacing.x;
+    let available = ui.available_width();
+    let width = ((available - spacing * (count - 1.0)) / count).max(280.0);
+    let height = ui.available_height();
+
+    let TerminalState {
+        panes,
+        names,
+        names_changed,
+        editing,
+        rename_draft,
+    } = state;
+    egui::ScrollArea::horizontal()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                for connection in &connections {
+                    let pane = panes.entry(connection.id).or_default();
+                    column(
+                        ui,
+                        engine,
+                        connection,
+                        pane,
+                        width,
+                        height,
+                        names,
+                        names_changed,
+                        editing,
+                        rename_draft,
+                    );
+                }
+            });
+        });
+    true
 }
 
-/// The row of connection tabs. Click switches the terminal, double-click renames the tab.
-fn terminal_tabs(ui: &mut Ui, connections: &[Arc<Connection>], state: &mut TerminalState) {
-    let mut start_edit: Option<(ConnectionId, String)> = None;
-    let mut commit: Option<(ConnectionId, String)> = None;
-
-    ui.horizontal_wrapped(|ui| {
-        for connection in connections {
+#[allow(clippy::too_many_arguments)]
+fn column(
+    ui: &mut Ui,
+    engine: &Engine,
+    connection: &Arc<Connection>,
+    pane: &mut TerminalPane,
+    width: f32,
+    height: f32,
+    names: &mut BTreeMap<String, String>,
+    names_changed: &mut bool,
+    editing: &mut Option<ConnectionId>,
+    rename_draft: &mut String,
+) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, height),
+        Layout::top_down(Align::Min),
+        |ui| {
+            ui.set_width(width);
             let key = connection_key(&connection.config);
-            let name = state
-                .names
+            let name = names
                 .get(&key)
                 .cloned()
                 .unwrap_or_else(|| default_name(&connection.config));
-
-            if state.editing == Some(connection.id) {
-                let editor = ui.add_sized(
-                    [120.0, 20.0],
-                    TextEdit::singleline(&mut state.rename_draft).hint_text("名称"),
-                );
-                editor.request_focus();
-                let enter = ui.input(|input| input.key_pressed(Key::Enter));
-                if enter || editor.lost_focus() {
-                    commit = Some((connection.id, state.rename_draft.clone()));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("●").color(state_color(&connection.state())));
+                if *editing == Some(connection.id) {
+                    let response = ui.add_sized(
+                        [(width - 56.0).max(80.0), 20.0],
+                        TextEdit::singleline(rename_draft).hint_text("名称"),
+                    );
+                    response.request_focus();
+                    if ui.input(|input| input.key_pressed(Key::Enter)) || response.lost_focus() {
+                        let trimmed = rename_draft.trim().to_owned();
+                        if trimmed.is_empty() {
+                            names.remove(&key);
+                        } else {
+                            names.insert(key.clone(), trimmed);
+                        }
+                        *names_changed = true;
+                        *editing = None;
+                        rename_draft.clear();
+                    }
+                } else {
+                    let response = ui
+                        .add(egui::Label::new(RichText::new(&name).strong()).sense(Sense::click()))
+                        .on_hover_text("双击重命名这个终端");
+                    if response.double_clicked() {
+                        *editing = Some(connection.id);
+                        *rename_draft = name.clone();
+                    }
                 }
-                continue;
-            }
-
-            let selected = state.selected == Some(connection.id);
-            let color = state_color(&connection.state());
-            let response = ui
-                .selectable_label(selected, RichText::new(format!("● {name}")).color(color))
-                .on_hover_text("单击切换终端，双击重命名");
-            if response.double_clicked() {
-                start_edit = Some((connection.id, name));
-            } else if response.clicked() {
-                state.selected = Some(connection.id);
-            }
-        }
-    });
-
-    if let Some((id, draft)) = start_edit {
-        state.editing = Some(id);
-        state.rename_draft = draft;
-    }
-    if let Some((id, draft)) = commit {
-        if let Some(connection) = connections.iter().find(|connection| connection.id == id) {
-            let key = connection_key(&connection.config);
-            let name = draft.trim();
-            if name.is_empty() {
-                state.names.remove(&key);
-            } else {
-                state.names.insert(key, name.to_owned());
-            }
-            state.names_changed = true;
-        }
-        state.editing = None;
-        state.rename_draft.clear();
-    }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("×").on_hover_text("关闭这个连接").clicked() {
+                        engine.close(connection.id);
+                    }
+                });
+            });
+            ui.separator();
+            body(ui, engine, connection, &connection.shared, pane);
+        },
+    );
 }
 
 /// Draws the terminal of one connection and sends whatever is typed into it.
@@ -239,7 +245,7 @@ fn body(
     engine: &Engine,
     connection: &Connection,
     shared: &SessionShared,
-    state: &mut TerminalState,
+    pane: &mut TerminalPane,
 ) {
     // One monospace cell, measured from a frame's own font.
     let font = FontId::monospace(FONT_SIZE);
@@ -283,14 +289,14 @@ fn body(
     let grid = rect.shrink2(Vec2::new(PAD_X, PAD_Y));
     let cols = ((grid.width() / cell_width).floor() as u16).max(2);
     let rows = ((grid.height() / line_height).floor() as u16).max(2);
-    if (rows, cols) != state.size {
+    if (rows, cols) != pane.size {
         let mut terminal = shared.terminal.write();
         terminal.resize(rows, cols);
         // A selection is in cells, and a resize reflows those cells.
-        if state.selection.take().is_some() {
+        if pane.selection.take().is_some() {
             terminal.scroll_to_live();
         }
-        state.size = (rows, cols);
+        pane.size = (rows, cols);
     }
 
     // The wheel walks through history, the way a terminal does. It ends a selection: the mouse
@@ -299,7 +305,7 @@ fn body(
     if response.hovered() && wheel != 0.0 {
         let lines = ((wheel.abs() / line_height).ceil() as usize).max(1);
         let mut terminal = shared.terminal.write();
-        state.selection = None;
+        pane.selection = None;
         if wheel > 0.0 {
             terminal.scroll_back(lines);
         } else {
@@ -311,16 +317,16 @@ fn body(
     // into the scrollback moves the view one line further back, which keeps the same lines on
     // screen without copying them. When the scrollback is full it can no longer compensate; that
     // is a selection frozen for thousands of lines, long after it was copied.
-    if state.selection.is_some() {
+    if pane.selection.is_some() {
         let mut terminal = shared.terminal.write();
         let len = terminal.scrollback_len();
-        if len > state.selection_scrollback {
-            let growth = len - state.selection_scrollback;
+        if len > pane.selection_scrollback {
+            let growth = len - pane.selection_scrollback;
             terminal.scroll_back(growth);
-            state.selection_scrollback = len;
-        } else if len < state.selection_scrollback {
+            pane.selection_scrollback = len;
+        } else if len < pane.selection_scrollback {
             // The history was cleared underneath the selection.
-            state.selection = None;
+            pane.selection = None;
         }
     }
 
@@ -339,23 +345,23 @@ fn body(
         if let Some(pos) = response.interact_pointer_pos() {
             let (row, col) = cell_at(pos);
             let terminal = shared.terminal.read();
-            state.selection = word_at(&terminal, row, col);
-            state.selection_scrollback = terminal.scrollback_len();
+            pane.selection = word_at(&terminal, row, col);
+            pane.selection_scrollback = terminal.scrollback_len();
         }
     } else if response.drag_started_by(PointerButton::Primary) {
         if let Some(origin) = ui.input(|input| input.pointer.press_origin()) {
             let anchor = cell_at(origin);
             let head = response.interact_pointer_pos().map_or(anchor, cell_at);
-            state.selection = Some(Selection { anchor, head });
-            state.selection_scrollback = shared.terminal.read().scrollback_len();
+            pane.selection = Some(Selection { anchor, head });
+            pane.selection_scrollback = shared.terminal.read().scrollback_len();
         }
     } else if response.dragged_by(PointerButton::Primary) {
         if let (Some(pos), Some(selection)) =
-            (response.interact_pointer_pos(), state.selection.as_mut())
+            (response.interact_pointer_pos(), pane.selection.as_mut())
         {
             selection.head = cell_at(pos);
         }
-    } else if response.clicked() && state.selection.take().is_some() {
+    } else if response.clicked() && pane.selection.take().is_some() {
         // Clicking without dragging ends the selection and returns to live output.
         shared.terminal.write().scroll_to_live();
     }
@@ -364,7 +370,7 @@ fn body(
     // Ctrl+Shift+C always means copy, and is swallowed either way.
     let copy_key =
         focused && ui.input(|input| input.modifiers.command && input.key_pressed(Key::C));
-    if copy_key && let Some(selection) = state.selection {
+    if copy_key && let Some(selection) = pane.selection {
         let terminal = shared.terminal.read();
         let text = selection_text(&terminal, selection);
         drop(terminal);
@@ -373,11 +379,11 @@ fn body(
         }
     }
     let swallow_ctrl_c =
-        copy_key && (state.selection.is_some() || ui.input(|input| input.modifiers.shift));
+        copy_key && (pane.selection.is_some() || ui.input(|input| input.modifiers.shift));
 
     // Keys go down the port as they are; the device echoes them back.
     if focused {
-        let bytes = typed_bytes(ui, &mut state.preedit, swallow_ctrl_c);
+        let bytes = typed_bytes(ui, &mut pane.preedit, swallow_ctrl_c);
         if !bytes.is_empty() {
             if connection.state().is_open()
                 && let Err(error) = engine.send(connection.id, &bytes)
@@ -385,11 +391,11 @@ fn body(
                 tracing::warn!(target: "embdbg::terminal", "发送失败：{error}");
             }
             // Typing ends the selection and returns to the live screen, the way a shell does.
-            state.selection = None;
+            pane.selection = None;
             shared.terminal.write().scroll_to_live();
         }
     } else {
-        state.preedit.clear();
+        pane.preedit.clear();
     }
 
     let terminal = shared.terminal.read();
@@ -442,7 +448,7 @@ fn body(
     }
 
     // The selection sits above the text but below the cursor; cells it covers stay readable.
-    if let Some(selection) = state.selection {
+    if let Some(selection) = pane.selection {
         let ((start_row, start_col), (end_row, end_col)) = selection.ordered();
         for row in start_row..=end_row.min(rows - 1) {
             let from = if row == start_row { start_col } else { 0 };
@@ -471,7 +477,7 @@ fn body(
     let live = terminal.is_live();
     let mut cursor_rect = cell_rect(grid, cursor_row, cursor_col, cell_width, line_height);
     let preedit = focused
-        .then(|| state.preedit.clone())
+        .then(|| pane.preedit.clone())
         .filter(|text| !text.is_empty());
     if let Some(text) = &preedit {
         let origin = cursor_rect.min;
@@ -550,6 +556,7 @@ fn body(
     drop(terminal);
 
     // Buttons on the status line do not take the keyboard away from the screen.
+    let compact = rect.width() < 420.0;
     let mut keep_focus = false;
     ui.horizontal(|ui| {
         ui.label(
@@ -558,56 +565,73 @@ fn body(
                 .small()
                 .color(theme::FG_DIM),
         );
-        if alternate {
-            ui.label(RichText::new("全屏程序").small().color(theme::ACCENT));
-        }
-        if !live {
+        if !compact {
+            if alternate {
+                ui.label(RichText::new("全屏程序").small().color(theme::ACCENT));
+            }
+            if !live {
+                ui.label(
+                    RichText::new(format!("回看 {offset} 行"))
+                        .small()
+                        .color(theme::WARNING),
+                );
+            }
+            if pane.selection.is_some() {
+                ui.label(
+                    RichText::new("已暂停刷新，点击恢复")
+                        .small()
+                        .color(theme::ACCENT),
+                );
+            }
+            if focused {
+                if ui.small_button("释放键盘").clicked() {
+                    response.surrender_focus();
+                }
+            } else {
+                ui.label(
+                    RichText::new(
+                        "点击后键盘输入，回车发送；拖选复制（Ctrl+Shift+C），滚轮回看历史",
+                    )
+                    .small()
+                    .color(theme::FG_DIM),
+                );
+            }
+        } else if !live {
             ui.label(
                 RichText::new(format!("回看 {offset} 行"))
                     .small()
                     .color(theme::WARNING),
             );
         }
-        if state.selection.is_some() {
-            ui.label(
-                RichText::new("已暂停刷新，点击恢复")
-                    .small()
-                    .color(theme::ACCENT),
-            );
-        }
-        if focused {
-            if ui.small_button("释放键盘").clicked() {
-                response.surrender_focus();
-            }
-        } else {
-            ui.label(
-                RichText::new("点击后键盘输入，回车发送；拖选复制（Ctrl+Shift+C），滚轮回看历史")
-                    .small()
-                    .color(theme::FG_DIM),
-            );
-        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.small_button("复制屏幕").clicked() {
+            if ui
+                .small_button(if compact { "复制" } else { "复制屏幕" })
+                .clicked()
+            {
                 ui.ctx().copy_text(shared.terminal.read().contents());
                 keep_focus = true;
             }
-            if let Some(selection) = state.selection
+            if let Some(selection) = pane.selection
                 && ui.small_button("复制选中").clicked()
             {
                 ui.ctx()
                     .copy_text(selection_text(&shared.terminal.read(), selection));
                 keep_focus = true;
             }
-            if ui.small_button("清屏").clicked() {
+            if !compact && ui.small_button("清屏").clicked() {
                 // Clears this view only; the device's screen is untouched.
-                state.selection = None;
+                pane.selection = None;
                 let mut terminal = shared.terminal.write();
                 terminal.scroll_to_live();
                 terminal.feed(b"\x1b[2J\x1b[H");
                 keep_focus = true;
             }
-            if !live && ui.small_button("回到底部").clicked() {
-                state.selection = None;
+            if !live
+                && ui
+                    .small_button(if compact { "到底" } else { "回到底部" })
+                    .clicked()
+            {
+                pane.selection = None;
                 shared.terminal.write().scroll_to_live();
                 keep_focus = true;
             }
